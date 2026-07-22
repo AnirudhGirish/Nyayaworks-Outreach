@@ -1,0 +1,5 @@
+anthropic>=0.40.0
+gspread>=6.1.0
+google-auth>=2.30.0
+python-dotenv>=1.0.1
+pytest>=8.0.0
