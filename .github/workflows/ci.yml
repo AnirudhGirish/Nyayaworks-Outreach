@@ -36,7 +36,7 @@ jobs:
 
       - name: Run Security Audit (Bandit)
         run: |
-          bandit config.py guardrails.py providers.py research.py run.py sheets.py state_machine.py warmup.py bounce_detection.py -l
+          bandit config.py guardrails.py providers.py research.py run.py sheets.py state_machine.py warmup.py bounce_detection.py -ll
 
       - name: Run Pytest Suite & Coverage
         env:
