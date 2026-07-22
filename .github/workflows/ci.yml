@@ -1,0 +1,48 @@
+name: CI & Quality Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff mypy pytest pytest-cov bandit
+
+      - name: Run Ruff Linter
+        run: |
+          ruff check . --exclude .venv
+
+      - name: Run Mypy Type Checker
+        run: |
+          mypy . --ignore-missing-imports --exclude .venv
+
+      - name: Run Security Audit (Bandit)
+        run: |
+          bandit config.py guardrails.py providers.py research.py run.py sheets.py state_machine.py warmup.py bounce_detection.py -l
+
+      - name: Run Pytest Suite & Coverage
+        env:
+          ANTHROPIC_API_KEY: "mock_key_for_ci"
+          SHEET_ID: "mock_sheet_id_for_ci"
+          EMAIL_PASSWORD: "mock_password_for_ci"
+          GOOGLE_SERVICE_ACCOUNT_JSON: '{"type": "service_account"}'
+        run: |
+          pytest -v --cov=. --cov-report=term-missing
