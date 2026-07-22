@@ -110,6 +110,8 @@ class SMTPProvider(SendProvider):
                     return messages
                 for num in data[0].split():
                     _, msg_data = imap.fetch(num, "(RFC822)")
+                    if not msg_data or not isinstance(msg_data[0], tuple):
+                        continue
                     raw = msg_data[0][1]
                     if not isinstance(raw, (bytes, bytearray)):
                         continue
