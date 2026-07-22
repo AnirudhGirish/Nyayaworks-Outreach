@@ -5,12 +5,11 @@ Run this script to simulate a single execution run end-to-end.
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
-import config
-from sheets import GspreadClient
-import state_machine
+import config  # noqa: E402
+from sheets import GspreadClient  # noqa: E402
+import state_machine  # noqa: E402
 
 
 def verify_pipeline():
@@ -51,9 +50,9 @@ def verify_pipeline():
     window_open = in_hours and not is_sunday
     print(f"Send Window Open?   : {'YES' if window_open else 'NO (Outside 9am-6pm IST or Sunday)'}")
 
-    # 4. Scan Leads Queue
+# 4. Scan Leads Queue
     leads = sheets.get_leads()
-    print(f"\n--- [LEADS QUEUE BREAKDOWN] ---")
+    print("\n--- [LEADS QUEUE BREAKDOWN] ---")
     print(f"Total Leads Loaded  : {len(leads)}")
     
     states_count = {}
