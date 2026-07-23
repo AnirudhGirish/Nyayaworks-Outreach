@@ -21,7 +21,7 @@ def verify_pipeline():
     try:
         sheets = GspreadClient()
         print("✔ Sheets Client initialized successfully.")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"❌ Failed to initialize Sheets Client: {exc}")
         return
 

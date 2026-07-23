@@ -72,13 +72,8 @@ def check_notable_fact_usage(body: str, research: dict[str, Any] | None) -> str 
         return None
     confidence = research.get("confidence")
     notable_fact = research.get("notable_fact")
-    if confidence != "high" and notable_fact:
-        # The AI was told to use the fallback; if the notable_fact text still
-        # appears verbatim in the body, that's a violation.
-        if notable_fact and notable_fact in body:
-            return (
-                "notable_fact used in body but research confidence is not high"
-            )
+    if confidence != "high" and notable_fact and notable_fact in body:
+        return "notable_fact used in body but research confidence is not high"
     return None
 
 
