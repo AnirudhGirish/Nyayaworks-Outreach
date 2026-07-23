@@ -33,7 +33,7 @@ def verify_pipeline():
         print(f"Sent Today          : {control.get('sent_today')}")
         print(f"Is Locked           : {control.get('is_locked')}")
         print(f"Last Error          : {control.get('last_error') or 'None'}")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"❌ Failed to read control tab: {exc}")
         return
 

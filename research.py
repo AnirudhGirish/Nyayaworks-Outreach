@@ -104,8 +104,8 @@ def resolve_model(client, preferred: str | None = None) -> str:
         return preferred
     sonnet = [mid for mid in ids if "claude-3-5-sonnet" in mid]
     if sonnet:
-        # Prefer the latest (longest id string sorts newest typically).
-        return sorted(sonnet)[-1]
+    # Prefer the latest (longest id string sorts newest typically).
+        return max(sonnet)
     raise RuntimeError(
         f"resolve_model: preferred model {preferred!r} is not in the live "
         f"model list and no claude-3-5-sonnet variant was found. "
