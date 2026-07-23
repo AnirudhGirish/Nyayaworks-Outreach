@@ -3,10 +3,8 @@
 Flow per run (§2):
   1. Check control.is_locked; if set and < LOCK_TTL_MINUTES old, exit (another
      run is still in flight). Otherwise acquire the lock.
-  2. sync_status() — poll IMAP for bounces/replies on SENT rows.
-  3. If warmup_phase == active: run ONE warmup step, no cold leads.
-     Else: check daily cap, fetch next lead, advance ONE stage, write back.
-     (A low warmup trickle continues even after warmup completes.)
+  2. sync_status() — poll Resend API event status & IMAP for replies on SENT rows.
+  3. Check daily cap and send window, fetch next lead, advance ONE stage, write back.
   4. Clear control.is_locked.
 
 Every external call is wrapped so failures go to error_log, never crash the
@@ -29,7 +27,7 @@ from datetime import datetime, timedelta, timezone  # noqa: E402
 
 import config  # noqa: E402
 import research  # noqa: E402
-from providers import SMTPProvider  # noqa: E402
+from providers import ResendProvider  # noqa: E402
 from sheets import GspreadClient, SheetsClient  # noqa: E402
 from state_machine import (  # noqa: E402
     enforce_suppression,
@@ -37,7 +35,6 @@ from state_machine import (  # noqa: E402
     sync_status,
     transition,
 )
-from warmup import run_warmup_step, within_trickle_budget  # noqa: E402
 
 
 def _preflight_credentials() -> None:
@@ -48,9 +45,9 @@ def _preflight_credentials() -> None:
     """
     missing: list[str] = []
     checks = [
+        ("RESEND_API_KEY", config.RESEND_API_KEY or os.environ.get("RESEND_API_KEY")),
         ("ANTHROPIC_API_KEY", config.ANTHROPIC_API_KEY or os.environ.get("ANTHROPIC_API_KEY")),
         ("SHEET_ID", config.SHEET_ID or os.environ.get("SHEET_ID")),
-        ("EMAIL_PASSWORD", config.EMAIL_PASSWORD or os.environ.get("EMAIL_PASSWORD")),
         ("GOOGLE_SERVICE_ACCOUNT_JSON", config.GOOGLE_SERVICE_ACCOUNT_JSON or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")),
     ]
     for name, val in checks:
@@ -145,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the full pipeline except the actual SMTP send.",
+        help="Run the full pipeline except actual Resend email dispatch.",
     )
     args = parser.parse_args(argv)
     dry_run = args.dry_run
@@ -153,9 +150,9 @@ def main(argv: list[str] | None = None) -> int:
     _preflight_credentials()
 
     sheets = GspreadClient()
-    provider = SMTPProvider()
+    provider = ResendProvider()
 
-    # Bootstrap the three tabs + headers + control defaults if missing.
+    # Bootstrap tabs + headers + control defaults if missing.
     sheets.setup_sheet()
 
     if not _acquire_lock(sheets):
@@ -165,32 +162,17 @@ def main(argv: list[str] | None = None) -> int:
         ctrl = sheets.get_control()
         leads = sheets.get_leads()
 
-        # Rule 2: re-check suppression on every run, before anything else.
+        # Re-check suppression on every run before anything else.
         _maybe_suppress(sheets, leads)
         leads = sheets.get_leads()
 
-        # Step 2: sync status (bounces / replies).
+        # Step 2: sync status (Resend event polling & IMAP replies).
         changed = sync_status(leads, provider, sheets=sheets)
         if changed:
             sheets.batch_update_leads(changed)
             leads = sheets.get_leads()
 
-        warmup_phase = (ctrl.get("warmup_phase") or "active").strip().lower()
-
-        # Low trickle after warmup completes (§8.5).
-        if warmup_phase == "complete":
-            peers = sheets.get_warmup_peers()
-            sent_today = int(ctrl.get("sent_today", 0) or 0)
-            if within_trickle_budget(sent_today, ctrl) and _window_open(ctrl):
-                _run_one_warmup(sheets, provider, peers)
-
-        if warmup_phase == "active":
-            # Hard gate: NO cold leads while warming up.
-            peers = sheets.get_warmup_peers()
-            _run_one_warmup(sheets, provider, peers)
-            return 0
-
-        # warmup complete: process ONE lead transition.
+        # Process ONE lead transition.
         ctrl = _maybe_reset_daily_cap(sheets, ctrl)
         daily_cap = int(ctrl.get("daily_cap", 0) or 0)
         sent_today = int(ctrl.get("sent_today", 0) or 0)
@@ -224,42 +206,6 @@ def main(argv: list[str] | None = None) -> int:
             _release_lock(sheets)
         except Exception:
             # Never let a lock-release failure mask the original error.
-            pass
-
-
-def _run_one_warmup(sheets: SheetsClient, provider: SMTPProvider, peers: list[dict]) -> None:
-    """Execute one warmup action; never crash the caller on failure.
-
-    Failures are written to control.last_error so a stalled warmup (e.g.
-    expired peer app password) is visible in the Sheet, not just logs.
-    """
-    from anthropic import Anthropic
-
-    try:
-        client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
-        model = research.resolve_model(client)
-        result = run_warmup_step(peers, provider, client, model)
-        if result and "row" in result:
-            sheets.update_warmup_peers([result["row"]])
-        if result and "error" in result:
-            msg = result["error"]
-            print(f"warmup non-fatal: {msg}")
-            try:
-                sheets.set_control({"last_error": f"warmup: {msg}"})
-            except Exception:
-                pass
-        elif result is not None:
-            # Success — clear any previous warmup error
-            try:
-                sheets.set_control({"last_error": ""})
-            except Exception:
-                pass
-    except Exception as exc:
-        msg = f"warmup step failed: {exc}"
-        print(f"warmup step failed (non-fatal): {msg}")
-        try:
-            sheets.set_control({"last_error": msg})
-        except Exception:
             pass
 
 

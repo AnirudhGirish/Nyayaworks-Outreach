@@ -33,14 +33,8 @@ def _sheets_call(fn: Callable[..., T], *args, **kwargs) -> T:
     connection errors, re-raising as RuntimeError so callers can log it.
     """
     try:
-        # gspread doesn't accept a timeout kwarg directly, but the underlying
-        # httpx client (used by google-auth) respects GOOGLE_AUTH_HTTP_TIMEOUT.
-        # We set it at import time below; here we just catch errors.
         return fn(*args, **kwargs)
     except Exception as exc:
-        # gspread.exceptions.APIError, google.auth.exceptions.TransportError,
-        # requests.exceptions.Timeout, requests.exceptions.ConnectionError —
-        # all caught and re-raised as RuntimeError with context.
         raise RuntimeError(f"Sheets API call failed ({fn.__name__}): {exc}") from exc
 
 
@@ -95,12 +89,6 @@ class SheetsClient(ABC):
     @abstractmethod
     def set_control(self, updates: dict[str, Any]) -> None: ...
 
-    @abstractmethod
-    def get_warmup_peers(self) -> list[dict[str, Any]]: ...
-
-    @abstractmethod
-    def update_warmup_peers(self, rows: list[dict[str, Any]]) -> None: ...
-
 
 class GspreadClient(SheetsClient):
     """Concrete gspread-backed implementation using a service account."""
@@ -130,18 +118,11 @@ class GspreadClient(SheetsClient):
                 "GOOGLE_CREDENTIALS_PATH"
             )
 
-        # Set the HTTP request timeout on gspread's underlying requests.Session.
-        # gc.set_timeout() delegates to gc.http_client.set_timeout(n) which is
-        # passed verbatim as the `timeout=` kwarg on every session.request() call.
-        # The previously used os.environ.setdefault('GOOGLE_AUTH_HTTP_TIMEOUT', ...)
-        # is NOT read by google-auth's transport and had no effect.
         self.gc.set_timeout(config.SHEETS_TIMEOUT)
-
         self.sh = _sheets_call(self.gc.open_by_key, self.sheet_id)
         # Worksheets are bound lazily after setup_sheet() guarantees they exist.
         self.leads_ws = self._bind(config.LEADS_TAB)
         self.control_ws = self._bind(config.CONTROL_TAB)
-        self.peers_ws = self._bind(config.WARMUP_PEERS_TAB)
 
     def _bind(self, title: str):
         try:
@@ -151,7 +132,7 @@ class GspreadClient(SheetsClient):
 
     # -- bootstrap ---------------------------------------------------------
     def setup_sheet(self) -> None:
-        """Create the three tabs + header rows if they don't already exist.
+        """Create the tabs + header rows if they don't already exist.
 
         Safe to call every run: it only adds what is missing (idempotent).
         """
@@ -160,9 +141,6 @@ class GspreadClient(SheetsClient):
         )
         self.control_ws = self._ensure_tab(
             config.CONTROL_TAB, config.CONTROL_COLUMNS
-        )
-        self.peers_ws = self._ensure_tab(
-            config.WARMUP_PEERS_TAB, config.WARMUP_PEERS_COLUMNS
         )
         self._ensure_control_defaults()
 
@@ -187,9 +165,6 @@ class GspreadClient(SheetsClient):
             "send_window_start": "9",
             "send_window_end": "18",
             "is_locked": "",
-            "warmup_phase": "active",
-            "warmup_started_at": "",
-            "warmup_daily_target": "2",
             "last_error": "",
         }
         updates = []
@@ -208,11 +183,7 @@ class GspreadClient(SheetsClient):
         return [_coerce_row(r) for r in records]
 
     def batch_update_leads(self, rows: list[dict[str, Any]]) -> None:
-        """Batch-update whole rows for the given leads (matched by row_id).
-
-        A single `batch_update` call touches every cell in one request, which
-        keeps us far inside Google's rate limits versus per-field writes.
-        """
+        """Batch-update whole rows for the given leads (matched by row_id)."""
         if not rows:
             return
         header = _sheets_call(self.leads_ws.row_values, 1)
@@ -259,28 +230,6 @@ class GspreadClient(SheetsClient):
                 cells.append(gspread_cell(2, col_index, str(value)))
         if cells:
             _sheets_call(self.control_ws.update_cells, cells)
-
-    # -- warmup peers ------------------------------------------------------
-    def get_warmup_peers(self) -> list[dict[str, Any]]:
-        return _sheets_call(self.peers_ws.get_all_records)
-
-    def update_warmup_peers(self, rows: list[dict[str, Any]]) -> None:
-        header = _sheets_call(self.peers_ws.row_values, 1)
-        all_records = _sheets_call(self.peers_ws.get_all_records)
-        by_email = {r.get("peer_email"): r for r in all_records}
-        updates = []
-        for row in rows:
-            email = row.get("peer_email")
-            existing = by_email.get(email)
-            if existing is None:
-                continue
-            row_index = all_records.index(existing) + 2
-            payload = dict(existing)
-            payload.update(row)
-            values = [payload.get(col, "") for col in header]
-            updates.append({"range": f"A{row_index}", "values": [values]})
-        if updates:
-            _sheets_call(self.peers_ws.batch_update, updates)
 
 
 def gspread_cell(row: int, col: int, value: str):

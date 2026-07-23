@@ -1,13 +1,14 @@
-""""State machine transitions (§5).
+"""State machine transitions (§5).
 
 A lead advances exactly ONE stage per cron run, and do_not_contact forces
 SUPPRESSED before any transition. Each function mutates a copy of the lead row
 and returns it with updated state/timestamps — write_back() persists it.
-External calls (LLM, SMTP) are wrapped so failures are recorded in error_log
+External calls (LLM, Resend API) are wrapped so failures are recorded in error_log
 rather than crashing the run.
 """
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
@@ -15,7 +16,7 @@ from typing import Any
 import config
 import guardrails
 import research
-from bounce_detection import process_messages
+import template
 from providers import SendProvider
 
 
@@ -100,7 +101,7 @@ def transition(
     lead["attempts"] = int(lead.get("attempts", 0)) + 1
     state = lead.get("state")
 
-    # Early validation: required fields must be present before any LLM/SMTP calls.
+    # Early validation: required fields must be present before any LLM/send calls.
     email_val = (lead.get("email") or "").strip()
     if not email_val or "@" not in email_val:
         lead["state"] = config.STATE_FAILED
@@ -149,11 +150,24 @@ def transition(
                     lead["error_log"] = "duplicate email: another lead with this address is already SENT or later"
                     lead["last_updated_at"] = _now_iso()
                     return lead
+
+            html_body, text_body = template.render(
+                subject=lead["draft_subject"],
+                body=lead["draft_body"],
+                recipient_email=lead["email"],
+                recipient_name=lead.get("name"),
+            )
+
             if dry_run:
-                msg_id = f"<dry-run-{lead['row_id']}@nyayaworks.in>"
+                msg_id = f"dry-run-{lead['row_id']}"
             else:
                 msg_id = provider.send(
-                    lead["email"], lead["draft_subject"], lead["draft_body"]
+                    to_address=lead["email"],
+                    subject=lead["draft_subject"],
+                    html_body=html_body,
+                    text_body=text_body,
+                    row_id=str(lead.get("row_id", "")),
+                    attempts=int(lead.get("attempts", 1)),
                 )
             lead["provider_message_id"] = msg_id
             lead["sent_at"] = _now_iso()
@@ -172,38 +186,106 @@ def transition(
     return lead
 
 
+def _extract_address(from_header: str) -> str:
+    match = re.search(r"<([^>]+)>", from_header)
+    if match:
+        return match.group(1).strip()
+    return (from_header or "").strip()
+
+
 def sync_status(
     leads: list[dict[str, Any]],
     provider: SendProvider,
     sheets=None,
 ) -> list[dict[str, Any]]:
-    """Poll the inbox and return lead rows whose state changed (§9).
+    """Poll Resend API event status for SENT leads & IMAP for human replies.
 
-    If ``sheets`` is provided, IMAP failures are written to the control tab's
-    ``last_error`` field so a broken connection doesn't go unnoticed.
+    Updates lead states:
+      Resend events:
+        'delivered'        -> leave SENT
+        'bounced'          -> BOUNCED
+        'complained'       -> BOUNCED + do_not_contact=True
+        'delivery_delayed' -> leave SENT
+        'suppressed'        -> BOUNCED
+        Unrecognized       -> log to error_log, leave state unchanged
+      IMAP replies:
+        Inbound from lead  -> REPLIED
     """
+    updated_leads: list[dict[str, Any]] = []
+
+    # 1. Resend status polling for SENT leads
+    for lead in leads:
+        state = (lead.get("state") or "").strip().upper()
+        msg_id = lead.get("provider_message_id", "").strip()
+        if state != config.STATE_SENT or not msg_id:
+            continue
+
+        try:
+            event = provider.get_email_status(msg_id)
+        except Exception as exc:
+            # Non-fatal per-lead status fetch error
+            print(f"Status check error for lead {lead.get('row_id')}: {exc}")
+            continue
+
+        if not event:
+            continue
+
+        event_str = str(event).strip().lower()
+        lead_copy = deepcopy(lead)
+
+        if event_str == "delivered":
+            pass  # Leave state as SENT
+        elif event_str == "bounced":
+            lead_copy["state"] = config.STATE_BOUNCED
+            lead_copy["last_updated_at"] = _now_iso()
+            updated_leads.append(lead_copy)
+        elif event_str == "complained":
+            lead_copy["state"] = config.STATE_BOUNCED
+            lead_copy["do_not_contact"] = True
+            lead_copy["error_log"] = "Recipient complained (spam report)"
+            lead_copy["last_updated_at"] = _now_iso()
+            updated_leads.append(lead_copy)
+        elif event_str == "delivery_delayed":
+            pass  # Leave state as SENT
+        elif event_str == "suppressed":
+            lead_copy["state"] = config.STATE_BOUNCED
+            lead_copy["error_log"] = "Recipient email suppressed by Resend"
+            lead_copy["last_updated_at"] = _now_iso()
+            updated_leads.append(lead_copy)
+        else:
+            # Unrecognized event
+            lead_copy["error_log"] = f"Unrecognized Resend event: {event}"
+            lead_copy["last_updated_at"] = _now_iso()
+            updated_leads.append(lead_copy)
+
+    # 2. IMAP polling for human replies landing in the inbox
     try:
         messages = provider.fetch_unread()
+        if sheets is not None:
+            sheets.set_control({"last_error": ""})
     except Exception as exc:
-        msg = f"IMAP fetch failed: {exc}"
-        print(f"sync_status: {msg}")
+        err_msg = f"IMAP fetch failed: {exc}"
+        print(f"sync_status: {err_msg}")
         if sheets is not None:
             try:
-                sheets.set_control({"last_error": msg})
+                sheets.set_control({"last_error": err_msg})
             except Exception:
                 pass
-        return []
-    # Clear any previous IMAP error on success
-    if sheets is not None:
-        try:
-            sheets.set_control({"last_error": ""})
-        except Exception:
-            pass
-    updates = process_messages(messages, leads)
-    changed: list[dict[str, Any]] = []
-    for lead, new_state in updates:
-        updated = deepcopy(lead)
-        updated["state"] = new_state
-        updated["last_updated_at"] = _now_iso()
-        changed.append(updated)
-    return changed
+        messages = []
+
+    if messages:
+        # Build map of email -> lead for SENT leads
+        by_email = {
+            (lead.get("email") or "").strip().lower(): lead
+            for lead in leads
+            if (lead.get("state") or "").strip().upper() == config.STATE_SENT
+        }
+        for msg in messages:
+            sender = _extract_address(str(msg.get("from", ""))).lower()
+            if sender and sender in by_email:
+                matched_lead = deepcopy(by_email[sender])
+                matched_lead["state"] = config.STATE_REPLIED
+                matched_lead["last_updated_at"] = _now_iso()
+                updated_leads.append(matched_lead)
+
+    return updated_leads

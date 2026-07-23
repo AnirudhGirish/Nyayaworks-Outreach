@@ -1,101 +1,132 @@
-"""Send provider abstraction + Titan (GoDaddy Professional Email) SMTP/IMAP.
+"""Delivery backend abstraction + Resend HTTPS API & IMAP polling.
 
-Both SMTP and IMAP use ssl.create_default_context() with no plaintext fallback
-(non-negotiable, §3/§9). The :class:`SendProvider` ABC means a future
-provider (e.g. Smartlead) can be swapped in without touching business logic.
-
-Every external call has an explicit timeout and catches the specific network
-exception so the caller (state_machine) can log it without crashing the run.
+Uses the official Resend Python SDK for email dispatch (with Idempotency-Key
+header support) and status polling. Retains IMAP reading via ssl.create_default_context()
+for detecting human replies landing in the mailbox.
 """
 from __future__ import annotations
 
 import email
-import email.utils
 import imaplib
-import smtplib
 import ssl
 from abc import ABC, abstractmethod
-from email.message import EmailMessage
-from typing import Any
+from typing import Any, cast
 
 import config
+import resend
 
 
 class SendProvider(ABC):
     """Interface implemented by every delivery backend."""
 
     @abstractmethod
-    def send(self, to_address: str, subject: str, body: str) -> str:
-        """Send a message. Return the server Message-ID for correlation."""
+    def send(
+        self,
+        to_address: str,
+        subject: str,
+        html_body: str,
+        text_body: str,
+        row_id: str = "",
+        attempts: int = 1,
+        reply_to: str | None = None,
+    ) -> str:
+        """Send a message. Return the provider email ID for correlation."""
 
     @abstractmethod
     def fetch_unread(self) -> list[dict[str, Any]]:
         """Return new/unseen messages as parsed dicts for status polling."""
 
+    @abstractmethod
+    def get_email_status(self, email_id: str) -> str | None:
+        """Retrieve the last_event status string from Resend for an email ID."""
 
-class SMTPProvider(SendProvider):
-    """Raw SSL SMTP send + IMAP poll against Titan endpoints."""
+
+class ResendProvider(SendProvider):
+    """Resend API send & status polling + IMAP reply fetch."""
 
     def __init__(
         self,
-        smtp_host: str | None = None,
-        smtp_port: int | None = None,
+        api_key: str | None = None,
         imap_host: str | None = None,
         imap_port: int | None = None,
         user: str | None = None,
         password: str | None = None,
         from_address: str | None = None,
         from_name: str | None = None,
+        reply_to_address: str | None = None,
     ) -> None:
-        self.smtp_host = smtp_host or config.SMTP_HOST
-        self.smtp_port = smtp_port or config.SMTP_PORT
+        self.api_key = api_key or config.RESEND_API_KEY
         self.imap_host = imap_host or config.IMAP_HOST
         self.imap_port = imap_port or config.IMAP_PORT
         self.user = user or config.EMAIL_USER
         self.password = password or config.EMAIL_PASSWORD
         self.from_address = from_address or config.FROM_ADDRESS
         self.from_name = from_name or config.FROM_NAME
-        self._ctx = ssl.create_default_context()  # shared, SSL-only context
-        self._smtp_timeout = config.SMTP_TIMEOUT
+        self.reply_to_address = reply_to_address or getattr(config, "REPLY_TO_ADDRESS", "founder@nyayaworks.in")
+
+        resend.api_key = self.api_key
+        self._ctx = ssl.create_default_context()
         self._imap_timeout = config.IMAP_TIMEOUT
 
-        if not self.password:
-            raise RuntimeError("EMAIL_PASSWORD is not configured")
+    # -- Resend HTTP API ---------------------------------------------------
+    def send(
+        self,
+        to_address: str,
+        subject: str,
+        html_body: str,
+        text_body: str,
+        row_id: str = "",
+        attempts: int = 1,
+        reply_to: str | None = None,
+    ) -> str:
+        if not resend.api_key:
+            raise RuntimeError("RESEND_API_KEY is not configured")
 
-    # -- SMTP --------------------------------------------------------------
-    def send(self, to_address: str, subject: str, body: str) -> str:
-        msg = EmailMessage()
-        msg["From"] = f"{self.from_name} <{self.from_address}>"
-        msg["To"] = to_address
-        msg["Subject"] = subject
-        msg.set_content(body)
+        reply_to_target = reply_to or self.reply_to_address
 
-        # Explicitly generate a deterministic Message-ID header before sending
-        domain = self.from_address.split("@")[-1] if "@" in self.from_address else "nyayaworks.in"
-        msg_id = email.utils.make_msgid(domain=domain)
-        msg["Message-ID"] = msg_id
+        params: dict[str, Any] = {
+            "from": f"{self.from_name} <{self.from_address}>",
+            "to": [to_address],
+            "subject": subject,
+            "html": html_body,
+            "text": text_body,
+        }
+        if reply_to_target:
+            params["reply_to"] = reply_to_target
+
+        idempotency_key = f"{row_id}_{attempts}" if row_id else ""
+        options = {"idempotency_key": idempotency_key} if idempotency_key else None
 
         try:
-            with smtplib.SMTP_SSL(
-                self.smtp_host,
-                self.smtp_port,
-                context=self._ctx,
-                timeout=self._smtp_timeout,
-            ) as server:
-                server.login(self.user, self.password)
-                server.send_message(msg)
-        except smtplib.SMTPException as exc:
-            raise RuntimeError(f"SMTP send failed: {exc}") from exc
-        except OSError as exc:
-            raise RuntimeError(f"SMTP socket error: {exc}") from exc
+            resp = resend.Emails.send(
+                cast(resend.Emails.SendParams, params),
+                options=cast(resend.Emails.SendOptions, options) if options else None,
+            )
+            email_id = resp.get("id") if hasattr(resp, "get") else getattr(resp, "id", None)
+            if not email_id:
+                raise RuntimeError(f"Resend response missing 'id': {resp!r}")
+            return str(email_id)
+        except Exception as exc:
+            raise RuntimeError(f"Resend send failed: {exc}") from exc
 
-        # Return the generated msg_id so state_machine records it in Column L!
-        return msg_id
+    def get_email_status(self, email_id: str) -> str | None:
+        if not resend.api_key:
+            raise RuntimeError("RESEND_API_KEY is not configured")
 
-    # -- IMAP --------------------------------------------------------------
+        try:
+            resp = resend.Emails.get(email_id)
+            last_event = resp.get("last_event") if hasattr(resp, "get") else getattr(resp, "last_event", None)
+            return str(last_event) if last_event is not None else None
+        except Exception as exc:
+            raise RuntimeError(f"Resend status lookup failed ({email_id}): {exc}") from exc
+
+    # -- IMAP (Inbound Reply Polling) --------------------------------------
     def fetch_unread(self) -> list[dict[str, Any]]:
         """Fetch unseen messages as parsed dicts (raw + mime)."""
         messages: list[dict[str, Any]] = []
+        if not self.password:
+            return messages
+
         try:
             with imaplib.IMAP4_SSL(
                 self.imap_host,

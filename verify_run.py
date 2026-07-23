@@ -29,7 +29,6 @@ def verify_pipeline():
     try:
         control = sheets.get_control()
         print("\n--- [CONTROL TAB STATUS] ---")
-        print(f"Warmup Phase        : {control.get('warmup_phase')}")
         print(f"Daily Cap           : {control.get('daily_cap')}")
         print(f"Sent Today          : {control.get('sent_today')}")
         print(f"Is Locked           : {control.get('is_locked')}")
@@ -50,7 +49,7 @@ def verify_pipeline():
     window_open = in_hours and not is_sunday
     print(f"Send Window Open?   : {'YES' if window_open else 'NO (Outside 9am-6pm IST or Sunday)'}")
 
-# 4. Scan Leads Queue
+    # 4. Scan Leads Queue
     leads = sheets.get_leads()
     print("\n--- [LEADS QUEUE BREAKDOWN] ---")
     print(f"Total Leads Loaded  : {len(leads)}")
@@ -85,7 +84,7 @@ def verify_pipeline():
         elif current_st == "DRAFTED":
             print("Action: Validate draft against guardrails (word count, unsubscribe, banned terms).")
         elif current_st == "QUEUED":
-            print("Action: Check DNC & duplicates, then dispatch email via SMTP.")
+            print("Action: Check DNC & duplicates, then dispatch email via Resend API.")
 
     print("=" * 60)
     print("Diagnostic Complete.")

@@ -14,10 +14,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.13
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
           cache: "pip"
 
       - name: Install dependencies
@@ -36,13 +36,15 @@ jobs:
 
       - name: Run Security Audit (Bandit)
         run: |
-          bandit config.py guardrails.py providers.py research.py run.py sheets.py state_machine.py warmup.py bounce_detection.py -ll
+          bandit config.py guardrails.py providers.py research.py run.py sheets.py state_machine.py template.py verify_run.py -ll
 
       - name: Run Pytest Suite & Coverage
         env:
+          RESEND_API_KEY: "re_mock_key_for_ci"
           ANTHROPIC_API_KEY: "mock_key_for_ci"
           SHEET_ID: "mock_sheet_id_for_ci"
           EMAIL_PASSWORD: "mock_password_for_ci"
           GOOGLE_SERVICE_ACCOUNT_JSON: '{"type": "service_account"}'
+          HTTP_TIMEOUT: "30"
         run: |
           pytest -v --cov=. --cov-report=term-missing

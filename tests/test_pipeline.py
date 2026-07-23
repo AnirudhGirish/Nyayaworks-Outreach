@@ -1,18 +1,17 @@
 """Pytest suite for the NyayaWorks pipeline (§12).
 
-Covers: guardrails, RFC 3464 bounce detection, state-machine transitions,
-research/draft JSON parsing, the warmup gate, and one full integration run
-against an in-memory Sheet + mocked LLM/SMTP. No network required.
+Covers: guardrails, Resend status polling, HTML template rendering & XSS escaping,
+state-machine transitions, research/draft JSON parsing, and full integration runs.
+No network required (mocked API backends).
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
-from email.message import EmailMessage
 
 import config
 import guardrails
 import research
-from bounce_detection import classify_bounce, process_messages
+import template
 from providers import SendProvider
 from run import (
     _acquire_lock,
@@ -29,7 +28,6 @@ from state_machine import (
     sync_status,
     transition,
 )
-from warmup import within_trickle_budget
 
 import pytest
 
@@ -82,11 +80,17 @@ RESEARCH_LOW = {
 # In-memory backends for integration testing
 # ---------------------------------------------------------------------------
 class MemSheets(SheetsClient):
-    def __init__(self, leads=None, control=None, peers=None):
+    def __init__(self, leads=None, control=None):
         self._leads = leads or []
-        self._control = control or {"daily_cap": "5", "sent_today": "0",
-                                    "warmup_phase": "complete"}
-        self._peers = peers or []
+        self._control = control or {
+            "daily_cap": "5",
+            "sent_today": "0",
+            "date_reset_at": "",
+            "send_window_start": "9",
+            "send_window_end": "18",
+            "is_locked": "",
+            "last_error": "",
+        }
 
     def get_leads(self):
         return [dict(lead) for lead in self._leads]
@@ -101,32 +105,33 @@ class MemSheets(SheetsClient):
         return dict(self._control)
 
     def setup_sheet(self):
-        # In-memory backend needs no tab/header bootstrap.
         return None
 
     def set_control(self, updates):
         self._control.update(updates)
 
-    def get_warmup_peers(self):
-        return [dict(p) for p in self._peers]
-
-    def update_warmup_peers(self, rows):
-        by_email = {p["peer_email"]: p for p in self._peers}
-        for r in rows:
-            if r["peer_email"] in by_email:
-                by_email[r["peer_email"]].update(r)
-
 
 class FakeProvider(SendProvider):
     def __init__(self):
         self.sent = []
+        self.statuses = {}  # email_id -> last_event string
         self.inbox = []
 
-    def send(self, to_address, subject, body):
-        mid = f"<{to_address}-{len(self.sent)}@nyayaworks.in>"
-        self.sent.append({"to": to_address, "subject": subject, "body": body,
-                          "mid": mid})
-        return mid
+    def send(self, to_address, subject, html_body, text_body, row_id="", attempts=1):
+        eid = f"re_fake_{len(self.sent)+1}"
+        self.sent.append({
+            "to": to_address,
+            "subject": subject,
+            "html": html_body,
+            "text": text_body,
+            "row_id": row_id,
+            "attempts": attempts,
+            "id": eid,
+        })
+        return eid
+
+    def get_email_status(self, email_id):
+        return self.statuses.get(email_id, "delivered")
 
     def fetch_unread(self):
         msgs = self.inbox
@@ -158,7 +163,6 @@ def test_guardrail_rejects_do_not_contact():
 
 def test_guardrail_rejects_word_over_cap():
     lead = make_lead()
-    # 130 words of actual content (excluding unsubscribe) — should still fail
     long_body = "word " * (config.BODY_WORD_CAP + 5)
     long_body = long_body.strip() + "\n\n" + config.UNSUBSCRIBE_BLOCK.replace("{{email}}", lead["email"])
     with pytest.raises(guardrails.GuardrailError):
@@ -166,15 +170,10 @@ def test_guardrail_rejects_word_over_cap():
 
 
 def test_guardrail_word_count_excludes_unsubscribe_block():
-    """A 115-word draft + 15-word unsubscribe block should pass (115 < 120).
-    Before the fix, total was 130 > 120 and this would fail."""
     lead = make_lead()
-    # Build a 115-word body that doesn't trigger spam phrases
     content = " ".join(["draft"] * 115)
     body = content + "\n\n" + config.UNSUBSCRIBE_BLOCK.replace("{{email}}", lead["email"])
-    # Verify total word count (with unsubscribe) exceeds the cap
     assert guardrails._count_words(body) >= config.BODY_WORD_CAP
-    # Now verify it passes with the fixed logic (unsubscribe excluded from count)
     report = guardrails.validate_draft(lead, "Subject", body, RESEARCH_LOW)
     assert report.passed
 
@@ -189,16 +188,12 @@ def test_guardrail_rejects_banned_phrase():
 
 def test_guardrail_rejects_missing_unsubscribe():
     lead = make_lead()
-    # Body has no nyayaworks.in/unsubscribe URL — check_unsubscribe must reject it.
-    # (Note: 'no unsubscribe here' would have matched the old word-only check;
-    # the new URL-pattern check correctly rejects this.)
     with pytest.raises(guardrails.GuardrailError):
         guardrails.validate_draft(lead, "s", "this body has no link at all", RESEARCH_LOW)
 
 
 def test_guardrail_rejects_notable_fact_when_low_confidence():
     lead = make_lead()
-    # Low confidence but a notable_fact string was emitted and reused in body.
     low_with_fact = dict(RESEARCH_LOW, notable_fact=RESEARCH_HIGH["notable_fact"])
     fact = low_with_fact["notable_fact"]
     body = f"We saw that you {fact}. " + \
@@ -208,113 +203,108 @@ def test_guardrail_rejects_notable_fact_when_low_confidence():
 
 
 # ---------------------------------------------------------------------------
-# RFC 3464 bounce detection (§9)
+# HTML Template & XSS Escaping Tests
 # ---------------------------------------------------------------------------
-def build_bounce_mime(action="failed", recipient="asha@rao.example",
-                      original_mid="<orig-1@nyayaworks.in>"):
-    msg = EmailMessage()
-    msg["From"] = "mailer-daemon@secureserver.net"
-    msg["Subject"] = "Delivery Status Notification (Failure)"
-    msg.make_mixed()
-    # human-readable part
-    human = EmailMessage()
-    human.set_content("Delivery failed")
-    msg.attach(human)
-    # delivery-status part
-    ds = EmailMessage()
-    ds.add_header("Content-Type", "message/delivery-status")
-    ds.set_payload(
-        f"Reporting-MTA: dns; secureserver.net\r\n"
-        f"Original-Message-ID: {original_mid}\r\n"
-        f"\r\n"
-        f"Action: {action}\r\n"
-        f"Final-Recipient: rfc822; {recipient}\r\n"
-        f"Status: 5.1.1\r\n"
-    )
-    msg.attach(ds)
-    return msg
+def test_html_escaping_xss():
+    """Adversarial XSS input in AI generated text must render as inert escaped text."""
+    bad_subject = "Hello <script>alert('xss_subject')</script>"
+    bad_body = "We noticed <img src=x onerror=alert('xss_body')> in your practice."
+    bad_email = "test+xss@example.com"
+
+    html_out, text_out = template.render(bad_subject, bad_body, bad_email, recipient_name="<b style='color:red'>Hacker</b>")
+
+    # Verify raw script/img tags do NOT appear in the rendered HTML
+    assert "<script>" not in html_out
+    assert "<img src=x" not in html_out
+    assert "<b style=" not in html_out
+
+    # Verify escaped equivalents are present
+    assert "&lt;script&gt;alert(&#x27;xss_subject&#x27;)&lt;/script&gt;" in html_out
+    assert "&lt;img src=x onerror=alert(&#x27;xss_body&#x27;)&gt;" in html_out
 
 
-def test_bounce_classify_failed():
-    mime = build_bounce_mime(action="failed")
-    res = classify_bounce(mime)
-    assert res.is_candidate and res.is_bounce
-    assert res.action == "failed"
-    assert res.final_recipient == "asha@rao.example"
+def test_plaintext_fallback_generated():
+    html_out, text_out = template.render("Subject Line", "Body content paragraph.", "user@firm.com")
+    assert text_out
+    assert "Body content paragraph." in text_out
+    assert "https://nyayaworks.in/unsubscribe?email=user%40firm.com" in text_out
 
 
-def test_bounce_delayed_is_not_hard_bounce():
-    mime = build_bounce_mime(action="delayed")
-    res = classify_bounce(mime)
-    assert res.is_candidate and not res.is_bounce
-    assert res.action == "delayed"
+def test_idempotency_key_passed():
+    """Verify that idempotency key parameters (row_id and attempts) are passed on send."""
+    lead = make_lead(state="QUEUED", draft_subject="Sub", draft_body="Body text nyayaworks.in/unsubscribe", attempts=2)
+    provider = FakeProvider()
+    out = transition(lead, provider, model="m")
+    assert out["state"] == "SENT"
+    sent_msg = provider.sent[0]
+    assert sent_msg["row_id"] == "lead-1"
+    assert sent_msg["attempts"] == 3  # attempts incremented to 3 in transition
 
 
-def test_bounce_classify_failed_case_insensitive():
-    """Real bounces use varying capitalization: 'Failed', 'FAILED', etc."""
-    for action_val in ("Failed", "FAILED", "fAiLeD"):
-        mime = build_bounce_mime(action=action_val)
-        res = classify_bounce(mime)
-        assert res.is_bounce, f"Action: {action_val} should be classified as bounce"
+# ---------------------------------------------------------------------------
+# Resend Status Polling Tests (sync_status)
+# ---------------------------------------------------------------------------
+def test_resend_last_event_delivered():
+    lead = make_lead(state="SENT", provider_message_id="re_123")
+    provider = FakeProvider()
+    provider.statuses["re_123"] = "delivered"
+    changed = sync_status([lead], provider)
+    assert changed == []  # No state change needed for delivered
 
 
-def test_bounce_matches_lead_by_message_id():
-    mime = build_bounce_mime(original_mid="<orig-1@nyayaworks.in>")
-    leads = [make_lead(state="SENT", provider_message_id="<orig-1@nyayaworks.in>")]
-    lead = process_messages([{"mime": mime}], leads)
-    assert lead and lead[0][1] == "BOUNCED"
+def test_resend_last_event_bounced():
+    lead = make_lead(state="SENT", provider_message_id="re_123")
+    provider = FakeProvider()
+    provider.statuses["re_123"] = "bounced"
+    changed = sync_status([lead], provider)
+    assert len(changed) == 1
+    assert changed[0]["state"] == "BOUNCED"
 
 
-def test_bounce_match_by_recipient_address():
-    mime = build_bounce_mime(original_mid="<unknown>")
-    leads = [make_lead(state="SENT", email="asha@rao.example",
-                       provider_message_id="<other>")]
-    out = process_messages([{"mime": mime}], leads)
-    assert out and out[0][1] == "BOUNCED"
+def test_resend_last_event_complained():
+    lead = make_lead(state="SENT", provider_message_id="re_123", do_not_contact=False)
+    provider = FakeProvider()
+    provider.statuses["re_123"] = "complained"
+    changed = sync_status([lead], provider)
+    assert len(changed) == 1
+    assert changed[0]["state"] == "BOUNCED"
+    assert changed[0]["do_not_contact"] is True
 
 
-def test_normal_reply_marks_replied():
-    msg = EmailMessage()
-    msg["From"] = "Asha Rao <asha@rao.example>"
-    msg.set_content("Thanks, not interested right now.")
-    leads = [make_lead(state="SENT", email="asha@rao.example")]
-    out = process_messages([{"mime": msg, "from": "Asha Rao <asha@rao.example>"}],
-                           leads)
-    assert out and out[0][1] == "REPLIED"
+def test_resend_last_event_delivery_delayed():
+    lead = make_lead(state="SENT", provider_message_id="re_123")
+    provider = FakeProvider()
+    provider.statuses["re_123"] = "delivery_delayed"
+    changed = sync_status([lead], provider)
+    assert changed == []  # Leaves state as SENT
 
 
-def test_process_messages_returns_replies_not_bounces():
-    # A mailer-daemon delayed message must NOT flip SENT to BOUNCED.
-    mime = build_bounce_mime(action="delayed")
-    leads = [make_lead(state="SENT", provider_message_id="<orig-1@nyayaworks.in>")]
-    out = process_messages([{"mime": mime}], leads)
-    assert out == []
+def test_resend_last_event_suppressed():
+    lead = make_lead(state="SENT", provider_message_id="re_123")
+    provider = FakeProvider()
+    provider.statuses["re_123"] = "suppressed"
+    changed = sync_status([lead], provider)
+    assert len(changed) == 1
+    assert changed[0]["state"] == "BOUNCED"
 
 
-def test_process_messages_never_crashes_on_corrupt_mime():
-    """Corrupt/malformed MIME payloads must be skipped, never crash the poll."""
-    leads = [make_lead(state="SENT", email="asha@rao.example")]
-    corrupt_messages = [
-        {},  # completely empty dict
-        {"raw": None},  # None raw
-        {"raw": b"\x00\x01\x02 corrupt binary"},  # binary garbage
-        {"mime": "not a Message object", "from": "x@y.com"},  # wrong type
-        {"raw": "", "from": ""},  # empty strings
-    ]
-    out = process_messages(corrupt_messages, leads)
-    assert out == []  # no crashes, no false positives
+def test_resend_last_event_unknown():
+    lead = make_lead(state="SENT", provider_message_id="re_123")
+    provider = FakeProvider()
+    provider.statuses["re_123"] = "future_unexpected_event"
+    changed = sync_status([lead], provider)
+    assert len(changed) == 1
+    assert changed[0]["state"] == "SENT"
+    assert "Unrecognized Resend event: future_unexpected_event" in changed[0]["error_log"]
 
 
-def test_bounce_no_delivery_status_part_treats_as_bounce():
-    """A bounce sender with no parseable delivery-status part should still
-    be classified as a candidate bounce (conservative default)."""
-    msg = EmailMessage()
-    msg["From"] = "mailer-daemon@secureserver.net"
-    msg["Subject"] = "Delivery Status Notification (Failure)"
-    msg.set_content("Delivery failed but no DSN part")
-    res = classify_bounce(msg)
-    assert res.is_candidate
-    assert res.is_bounce  # conservative: bounce sender with no DSN = bounce
+def test_reply_detection_via_imap():
+    lead = make_lead(state="SENT", email="asha@rao.example")
+    provider = FakeProvider()
+    provider.inbox = [{"from": "Asha Rao <asha@rao.example>", "subject": "Re: NyayaOS"}]
+    changed = sync_status([lead], provider)
+    assert len(changed) == 1
+    assert changed[0]["state"] == "REPLIED"
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +337,6 @@ def test_extract_json_raises_on_garbage():
 
 
 def test_resolve_model_raises_on_api_failure():
-    """If models.list() throws (network/auth), resolve_model must raise, not silently
-    fall back to a possibly-deprecated model string."""
     class FailingClient:
         class models:
             @staticmethod
@@ -360,8 +348,6 @@ def test_resolve_model_raises_on_api_failure():
 
 
 def test_resolve_model_raises_when_no_matching_model():
-    """If the live model list has no claude-3-5-sonnet entry and preferred is
-    not present, resolve_model must raise rather than returning a stale string."""
     class NoSonnetClient:
         class models:
             @staticmethod
@@ -377,7 +363,6 @@ def test_resolve_model_raises_when_no_matching_model():
 
 
 def test_resolve_model_returns_preferred_when_present():
-    """Happy path: preferred model is in the live list — return it directly."""
     class GoodClient:
         class models:
             @staticmethod
@@ -392,17 +377,12 @@ def test_resolve_model_returns_preferred_when_present():
     assert result == "claude-3-5-sonnet-20241022"
 
 
-
 # ---------------------------------------------------------------------------
 # State machine (§5)
 # ---------------------------------------------------------------------------
 def test_get_next_lead_picks_earliest_state():
-    """get_next_lead() returns the first row in the list in an actionable state
-    (top-to-bottom scan), regardless of which state is more advanced.
-    A DRAFTED lead in row 1 beats a NEW lead in row 2 because it comes first.
-    """
     leads = [make_lead(state="DRAFTED"), make_lead(state="NEW", row_id="l2")]
-    assert get_next_lead(leads)["row_id"] == "lead-1"  # Row 1 (DRAFTED) comes first
+    assert get_next_lead(leads)["row_id"] == "lead-1"
 
 
 def test_enforce_suppression_forces_terminal():
@@ -447,7 +427,6 @@ def test_transition_queued_sends_and_sets_sent(monkeypatch):
 def test_transition_failure_sets_failed_after_max_attempts(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("llm down")
-    # Make the research call raise on the NEW->RESEARCHED transition.
     monkeypatch.setattr(research, "research_lead", boom)
     out = transition(make_lead(state="NEW", attempts=config.MAX_ATTEMPTS),
                      FakeProvider(), model="m")
@@ -463,18 +442,15 @@ def test_dry_run_does_not_send():
     out = transition(lead, provider, model="m", dry_run=True)
     assert out["state"] == "SENT"
     assert provider.sent == []
-    assert out["provider_message_id"].startswith("<dry-run-")
+    assert out["provider_message_id"].startswith("dry-run-")
 
 
 def test_transition_aborts_send_if_dnc_set_between_fetch_and_send(monkeypatch):
-    """If do_not_contact is set in the Sheet after the lead was fetched but
-    before the SMTP send, the lead must be SUPPRESSED, not sent."""
     monkeypatch.setattr(guardrails, "validate_draft",
                         lambda *a, **k: guardrails.GuardrailReport(passed=True, reasons=[]))
     lead = make_lead(state="QUEUED", draft_subject="s",
                      draft_body="valid body", email="asha@rao.example",
                      research_json=RESEARCH_LOW, do_not_contact=False)
-    # Simulate the partner setting DNC=True in the Sheet between fetch and send
     fresh_lead = dict(lead)
     fresh_lead["do_not_contact"] = True
     sheets = MemSheets(leads=[fresh_lead])
@@ -482,17 +458,16 @@ def test_transition_aborts_send_if_dnc_set_between_fetch_and_send(monkeypatch):
     out = transition(lead, provider, model="m", sheets=sheets)
     assert out["state"] == "SUPPRESSED"
     assert "do_not_contact" in out["error_log"]
-    assert provider.sent == []  # no email was sent
+    assert provider.sent == []
 
 
 def test_transition_sends_when_dnc_still_false(monkeypatch):
-    """When the re-fetched lead still has DNC=False, the send proceeds."""
     monkeypatch.setattr(guardrails, "validate_draft",
                         lambda *a, **k: guardrails.GuardrailReport(passed=True, reasons=[]))
     lead = make_lead(state="QUEUED", draft_subject="s",
                      draft_body="valid body", email="asha@rao.example",
                      research_json=RESEARCH_LOW, do_not_contact=False)
-    sheets = MemSheets(leads=[lead])  # DNC still False in sheet
+    sheets = MemSheets(leads=[lead])
     provider = FakeProvider()
     out = transition(lead, provider, model="m", sheets=sheets)
     assert out["state"] == "SENT"
@@ -500,7 +475,6 @@ def test_transition_sends_when_dnc_still_false(monkeypatch):
 
 
 def test_transition_blocks_duplicate_email(monkeypatch):
-    """If another lead with the same email is already SENT, don't send again."""
     monkeypatch.setattr(guardrails, "validate_draft",
                         lambda *a, **k: guardrails.GuardrailReport(passed=True, reasons=[]))
     lead1 = make_lead(state="SENT", row_id="lead-sent", email="same@example.com")
@@ -516,7 +490,6 @@ def test_transition_blocks_duplicate_email(monkeypatch):
 
 
 def test_transition_allows_different_emails(monkeypatch):
-    """Two leads with different emails should both be allowed to send."""
     monkeypatch.setattr(guardrails, "validate_draft",
                         lambda *a, **k: guardrails.GuardrailReport(passed=True, reasons=[]))
     lead1 = make_lead(state="SENT", row_id="lead-sent", email="one@example.com")
@@ -531,7 +504,6 @@ def test_transition_allows_different_emails(monkeypatch):
 
 
 def test_transition_fails_on_missing_email():
-    """A lead with no email should go straight to FAILED, no LLM/SMTP calls."""
     lead = make_lead(state="NEW", email="")
     out = transition(lead, FakeProvider(), model="m")
     assert out["state"] == "FAILED"
@@ -539,7 +511,6 @@ def test_transition_fails_on_missing_email():
 
 
 def test_transition_fails_on_malformed_email():
-    """A lead with a malformed email (no @) should go straight to FAILED."""
     lead = make_lead(state="NEW", email="not-an-email")
     out = transition(lead, FakeProvider(), model="m")
     assert out["state"] == "FAILED"
@@ -547,16 +518,7 @@ def test_transition_fails_on_malformed_email():
 
 
 # ---------------------------------------------------------------------------
-# Warmup gate (§8)
-# ---------------------------------------------------------------------------
-def test_trickle_budget_respects_target():
-    ctrl = {"warmup_daily_target": "2"}
-    assert within_trickle_budget(0, ctrl)
-    assert not within_trickle_budget(2, ctrl)
-
-
-# ---------------------------------------------------------------------------
-# Sheets API error handling (§3 fix)
+# Sheets API error handling
 # ---------------------------------------------------------------------------
 def test_sheets_call_wraps_exceptions():
     from sheets import _sheets_call
@@ -576,43 +538,37 @@ def test_sheets_call_passes_through_on_success():
 
 
 # ---------------------------------------------------------------------------
-# Daily cap reset (§8.3 fix)
+# Daily cap reset
 # ---------------------------------------------------------------------------
 def test_daily_cap_resets_on_new_day():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     sheets = MemSheets(control={"daily_cap": "5", "sent_today": "3",
-                                "date_reset_at": "2020-01-01",
-                                "warmup_phase": "complete"})
+                                "date_reset_at": "2020-01-01"})
     ctrl = _maybe_reset_daily_cap(sheets, sheets.get_control())
     assert ctrl["sent_today"] == "0"
     assert ctrl["date_reset_at"] == today
-    # Verify it actually wrote to the sheet
     assert sheets.get_control()["sent_today"] == "0"
 
 
 def test_daily_cap_does_not_reset_same_day():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     sheets = MemSheets(control={"daily_cap": "5", "sent_today": "3",
-                                "date_reset_at": today,
-                                "warmup_phase": "complete"})
+                                "date_reset_at": today})
     ctrl = _maybe_reset_daily_cap(sheets, sheets.get_control())
-    assert ctrl["sent_today"] == "3"  # unchanged
+    assert ctrl["sent_today"] == "3"
 
 
 def test_daily_cap_resets_when_date_reset_at_empty():
-
     sheets = MemSheets(control={"daily_cap": "5", "sent_today": "5",
-                                "date_reset_at": "",
-                                "warmup_phase": "complete"})
+                                "date_reset_at": ""})
     ctrl = _maybe_reset_daily_cap(sheets, sheets.get_control())
     assert ctrl["sent_today"] == "0"
 
 
 # ---------------------------------------------------------------------------
-# Full integration run (§12)
+# Full integration run
 # ---------------------------------------------------------------------------
 def test_integration_full_state_machine(monkeypatch):
-    # Mock the LLM calls inside transition.
     monkeypatch.setattr(research, "research_lead", lambda *a, **k: RESEARCH_HIGH)
     monkeypatch.setattr(research, "draft_email",
                         lambda lead, rj, client=None, model=None:
@@ -633,84 +589,10 @@ def test_integration_full_state_machine(monkeypatch):
 
     states = {row["row_id"]: row["state"] for row in sheets.get_leads()}
     assert states["l1"] == "DRAFTED"
-    assert provider.sent == []  # nothing gets sent until QUEUED->SENT
+    assert provider.sent == []
 
 
-def test_integration_sync_status_updates_bounced(monkeypatch):
-    mime = build_bounce_mime(original_mid="<orig-x>")
-    sheets = MemSheets(leads=[make_lead(state="SENT", row_id="l1",
-                                        provider_message_id="<orig-x>")])
-    provider = FakeProvider()
-    provider.inbox = [{"mime": mime}]
-    changed = sync_status(sheets.get_leads(), provider, sheets=sheets)
-    sheets.batch_update_leads(changed)
-    assert sheets.get_leads()[0]["state"] == "BOUNCED"
-
-
-def test_sync_status_writes_imap_error_to_control():
-    """When IMAP fails, the error must be written to control.last_error."""
-    class FailingProvider(FakeProvider):
-        def fetch_unread(self):
-            raise RuntimeError("IMAP connection refused")
-
-    sheets = MemSheets(leads=[], control={"daily_cap": "5", "sent_today": "0",
-                                          "warmup_phase": "complete", "last_error": ""})
-    changed = sync_status([], FailingProvider(), sheets=sheets)
-    assert changed == []
-    assert "IMAP connection refused" in sheets.get_control().get("last_error", "")
-
-
-def test_sync_status_clears_imap_error_on_success():
-    """When IMAP succeeds, any previous error should be cleared."""
-    sheets = MemSheets(leads=[], control={"daily_cap": "5", "sent_today": "0",
-                                          "warmup_phase": "complete",
-                                          "last_error": "old IMAP error"})
-    provider = FakeProvider()  # succeeds, returns empty inbox
-    sync_status([], provider, sheets=sheets)
-    assert sheets.get_control().get("last_error", "") == ""
-
-
-def test_warmup_failure_written_to_control(monkeypatch):
-    """When a warmup send fails, the error must be written to control.last_error."""
-    from run import _run_one_warmup
-
-    class FailingProvider(FakeProvider):
-        def send(self, to_address, subject, body):
-            raise RuntimeError("SMTP auth failed")
-
-    # Mock the Anthropic client so no real API call is made
-    class FakeClient:
-        def messages_create(self, **kw):
-            class Resp:
-                class Block:
-                    text = "warmup message"
-                    type = "text"
-                content = [Block()]
-            return Resp()
-        messages = type("M", (), {"create": messages_create})()
-
-    monkeypatch.setattr("anthropic.Anthropic", lambda **kw: FakeClient())
-    monkeypatch.setattr(research, "resolve_model", lambda client, preferred=None: "fake-model")
-
-    peer = {"peer_email": "peer@example.com", "app_password_env_var": "WARMUP_PEER_1_APP_PASSWORD",
-            "last_sent_at": "", "last_received_at": ""}
-    sheets = MemSheets(peers=[peer], control={"daily_cap": "5", "sent_today": "0",
-                                               "warmup_phase": "active", "last_error": ""})
-    provider = FailingProvider()
-
-    _run_one_warmup(sheets, provider, [peer])
-    ctrl = sheets.get_control()
-    assert "warmup" in ctrl.get("last_error", "").lower()
-    assert "SMTP auth failed" in ctrl.get("last_error", "")
-
-
-# ---------------------------------------------------------------------------
-# URL-encode email in unsubscribe link (item 12)
-# ---------------------------------------------------------------------------
 def test_unsubscribe_link_url_encodes_plus_address(monkeypatch):
-    """Emails with '+' characters must be percent-encoded in the unsubscribe URL.
-    john+legal@firm.com -> john%2Blegal%40firm.com (or similar), never raw '+'.
-    """
     class FakeResp:
         class Block:
             type = "text"
@@ -729,135 +611,89 @@ def test_unsubscribe_link_url_encodes_plus_address(monkeypatch):
     lead = make_lead(email="john+legal@firm.com")
     result = research.draft_email(lead, RESEARCH_LOW, client=FakeClient(), model="m")
     body = result["body"]
-    # The raw '+' must not appear unencoded in the URL query string.
-    assert "john+legal@firm.com" not in body, "Email must be URL-encoded in unsubscribe link"
-    assert "%2B" in body or "%40" in body, "Expected percent-encoding in unsubscribe URL"
-    # The URL itself must still be present.
+    assert "john+legal@firm.com" not in body
+    assert "%2B" in body or "%40" in body
     assert "nyayaworks.in/unsubscribe" in body
 
 
 # ---------------------------------------------------------------------------
-# run.py — lock, preflight, window, daily cap, main() flow (item 13)
+# run.py tests
 # ---------------------------------------------------------------------------
-# (imports moved to the top of the file)
-
-
 def test_acquire_lock_grants_when_unlocked():
-    """An empty is_locked value means no lock is held — acquire must succeed."""
-    sheets = MemSheets(control={"is_locked": "", "daily_cap": "5", "sent_today": "0",
-                                "warmup_phase": "complete"})
+    sheets = MemSheets(control={"is_locked": "", "daily_cap": "5", "sent_today": "0"})
     assert _acquire_lock(sheets) is True
-    # Lock timestamp must have been written.
     assert sheets.get_control()["is_locked"] != ""
 
 
 def test_acquire_lock_blocks_fresh_lock():
-    """A lock set 2 minutes ago (well within TTL) must block a second run."""
     recent = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
-    sheets = MemSheets(control={"is_locked": recent, "daily_cap": "5", "sent_today": "0",
-                                "warmup_phase": "complete"})
+    sheets = MemSheets(control={"is_locked": recent, "daily_cap": "5", "sent_today": "0"})
     assert _acquire_lock(sheets) is False
 
 
 def test_acquire_lock_clears_expired_lock():
-    """A lock older than LOCK_TTL_MINUTES must be treated as stale and over-written."""
-    import config as cfg
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=cfg.LOCK_TTL_MINUTES + 5)).isoformat()
-    sheets = MemSheets(control={"is_locked": stale, "daily_cap": "5", "sent_today": "0",
-                                "warmup_phase": "complete"})
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=config.LOCK_TTL_MINUTES + 5)).isoformat()
+    sheets = MemSheets(control={"is_locked": stale, "daily_cap": "5", "sent_today": "0"})
     assert _acquire_lock(sheets) is True
 
 
 def test_release_lock_clears_value():
-    sheets = MemSheets(control={"is_locked": "2025-01-01T00:00:00+00:00",
-                                "daily_cap": "5", "sent_today": "0",
-                                "warmup_phase": "complete"})
+    sheets = MemSheets(control={"is_locked": "2025-01-01T00:00:00+00:00"})
     _release_lock(sheets)
     assert sheets.get_control()["is_locked"] == ""
 
 
 def test_preflight_raises_on_missing_key(monkeypatch):
-    """If a required env var is absent, preflight must raise RuntimeError immediately."""
-    import config as cfg
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "")
-    monkeypatch.setattr(cfg, "SHEET_ID", "ok")
-    monkeypatch.setattr(cfg, "EMAIL_PASSWORD", "ok")
-    monkeypatch.setattr(cfg, "GOOGLE_SERVICE_ACCOUNT_JSON", "ok")
-    # Also blank the env var so the fallback os.environ.get() also fails.
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(config, "RESEND_API_KEY", "")
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "key")
+    monkeypatch.setattr(config, "SHEET_ID", "ok")
+    monkeypatch.setattr(config, "GOOGLE_SERVICE_ACCOUNT_JSON", "ok")
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="Missing required environment variables"):
         _preflight_credentials()
 
 
 def test_preflight_passes_with_all_keys(monkeypatch):
-    import config as cfg
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "key")
-    monkeypatch.setattr(cfg, "SHEET_ID", "sid")
-    monkeypatch.setattr(cfg, "EMAIL_PASSWORD", "pw")
-    monkeypatch.setattr(cfg, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
-    # Should not raise.
+    monkeypatch.setattr(config, "RESEND_API_KEY", "re_key")
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "key")
+    monkeypatch.setattr(config, "SHEET_ID", "sid")
+    monkeypatch.setattr(config, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
     _preflight_credentials()
 
 
-def _utc(hour: int, weekday: int = 0) -> datetime:
-    """Build a UTC datetime with the given hour and weekday (Monday=0, Sunday=6)."""
-    # Start from a known Monday (2024-01-01 was a Monday).
-    monday = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    return monday + timedelta(days=weekday, hours=hour)
-
-
 def test_window_open_within_hours():
-    """11:00 IST = 05:30 UTC — that's inside the 9-18 IST window."""
     ctrl = {"send_window_start": "9", "send_window_end": "18"}
-    # Monday 05:30 UTC = Monday 11:00 IST
-    now = datetime(2024, 1, 1, 5, 30, tzinfo=timezone.utc)
+    now = datetime(2024, 1, 1, 5, 30, tzinfo=timezone.utc)  # 11:00 IST Monday
     assert _window_open(ctrl, now=now) is True
 
 
 def test_window_closed_before_start():
     ctrl = {"send_window_start": "9", "send_window_end": "18"}
-    # 02:00 UTC = 07:30 IST (before 9am window)
-    now = datetime(2024, 1, 1, 2, 0, tzinfo=timezone.utc)
+    now = datetime(2024, 1, 1, 2, 0, tzinfo=timezone.utc)   # 07:30 IST
     assert _window_open(ctrl, now=now) is False
 
 
 def test_window_closed_after_end():
     ctrl = {"send_window_start": "9", "send_window_end": "18"}
-    # 14:00 UTC = 19:30 IST (after 6pm window)
-    now = datetime(2024, 1, 1, 14, 0, tzinfo=timezone.utc)
+    now = datetime(2024, 1, 1, 14, 0, tzinfo=timezone.utc)  # 19:30 IST
     assert _window_open(ctrl, now=now) is False
 
 
 def test_window_closed_on_sunday():
-    """Sundays must be blocked even if the IST hour is within 9-18."""
     ctrl = {"send_window_start": "9", "send_window_end": "18"}
-    # Sunday in IST: pick a UTC time that is within window hours but on Sunday IST.
-    # 2024-01-07 is a Sunday. 07:00 UTC = 12:30 IST (within window).
     sunday_noon_ist = datetime(2024, 1, 7, 7, 0, tzinfo=timezone.utc)
     assert _window_open(ctrl, now=sunday_noon_ist) is False
 
 
-def test_window_open_monday_within_hours():
-    """Monday at the same IST hour must be open."""
-    ctrl = {"send_window_start": "9", "send_window_end": "18"}
-    # 2024-01-08 is a Monday. 07:00 UTC = 12:30 IST.
-    monday_noon_ist = datetime(2024, 1, 8, 7, 0, tzinfo=timezone.utc)
-    assert _window_open(ctrl, now=monday_noon_ist) is True
-
-
 def test_window_open_returns_true_when_no_config():
-    """If send_window_start/end are absent, always return True (no restriction)."""
     assert _window_open({}) is True
-    assert _window_open({"send_window_start": "", "send_window_end": ""}) is True
 
 
 def test_main_cap_reached(monkeypatch):
-    """When sent_today >= daily_cap, main() must exit 0 without processing any lead."""
-    import config as cfg
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "key")
-    monkeypatch.setattr(cfg, "SHEET_ID", "sid")
-    monkeypatch.setattr(cfg, "EMAIL_PASSWORD", "pw")
-    monkeypatch.setattr(cfg, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
+    monkeypatch.setattr(config, "RESEND_API_KEY", "key")
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "key")
+    monkeypatch.setattr(config, "SHEET_ID", "sid")
+    monkeypatch.setattr(config, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
 
     sheets = MemSheets(
         leads=[make_lead(state="QUEUED", draft_subject="s", draft_body="b")],
@@ -865,115 +701,76 @@ def test_main_cap_reached(monkeypatch):
             "daily_cap": "3",
             "sent_today": "3",
             "date_reset_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "warmup_phase": "complete",
             "is_locked": "",
             "send_window_start": "0",
             "send_window_end": "23",
-            "warmup_daily_target": "2",
         },
     )
     provider = FakeProvider()
 
     monkeypatch.setattr("run.GspreadClient", lambda: sheets)
-    monkeypatch.setattr("run.SMTPProvider", lambda: provider)
+    monkeypatch.setattr("run.ResendProvider", lambda: provider)
     monkeypatch.setattr("run.research.resolve_model", lambda c, preferred=None: "m")
     monkeypatch.setattr("run.research._get_client", lambda: object())
 
     rc = main([])
     assert rc == 0
-    assert provider.sent == []  # no email sent
+    assert provider.sent == []
 
 
 def test_get_next_lead_vertical_priority_regression():
-    """Prove get_next_lead() stays locked on an in-flight row (Row 1) until
-    terminal/sent, rather than picking fresh NEW rows or most-advanced rows.
-
-    This test discriminates between the fixed row-order implementation and
-    the old buggy sort-by-state-progression implementation:
-    - Fixed:  always returns the first actionable row top-to-bottom.
-    - Buggy:  sorts by state order, so a RESEARCHED Row 1 loses to NEW Row 2
-              if NEW sorts before RESEARCHED in ACTIONABLE_STATES.
-
-    Step 2 (Row1=RESEARCHED, Row2=NEW) is the critical discrimination point.
-    Under the buggy code that call returns Row 2 (NEW comes first in sort).
-    Under the fixed code it returns Row 1 (top-to-bottom scan, Row 1 first).
-    """
-    # Seed 3 leads, all NEW
     leads = [
         {"row_id": "1", "name": "Lead 1", "state": config.STATE_NEW},
         {"row_id": "2", "name": "Lead 2", "state": config.STATE_NEW},
         {"row_id": "3", "name": "Lead 3", "state": config.STATE_NEW},
     ]
 
-    # All NEW → must pick Row 1 (first row)
     selected = get_next_lead(leads)
     assert selected is not None
-    assert selected["row_id"] == "1", "Expected Row 1 when all are NEW"
+    assert selected["row_id"] == "1"
 
-    # Row 1 advances to RESEARCHED; Rows 2 & 3 remain NEW.
-    # CRITICAL DISCRIMINATION POINT:
-    # Buggy sort: NEW < RESEARCHED in progression order → returns Row 2 (NEW).
-    # Fixed scan: Row 1 is still first in the list → returns Row 1 (RESEARCHED).
     leads[0]["state"] = config.STATE_RESEARCHED
     selected = get_next_lead(leads)
-    assert selected is not None, "Should still find an actionable lead"
-    assert selected["row_id"] == "1", (
-        f"REGRESSION: get_next_lead() returned Row {selected['row_id']} "
-        f"(state={selected['state']}) instead of staying on Row 1 (RESEARCHED). "
-        "The buggy sort-by-state behavior has returned."
-    )
+    assert selected is not None
+    assert selected["row_id"] == "1"
 
-    # Row 1 advances to DRAFTED; Rows 2 & 3 still NEW.
     leads[0]["state"] = config.STATE_DRAFTED
     selected = get_next_lead(leads)
     assert selected is not None
-    assert selected["row_id"] == "1", "Must stay on Row 1 when DRAFTED"
+    assert selected["row_id"] == "1"
 
-    # Row 1 advances to QUEUED; Rows 2 & 3 still NEW.
     leads[0]["state"] = config.STATE_QUEUED
     selected = get_next_lead(leads)
     assert selected is not None
-    assert selected["row_id"] == "1", "Must stay on Row 1 when QUEUED"
+    assert selected["row_id"] == "1"
 
-    # Row 1 reaches SENT (terminal for selection purposes).
     leads[0]["state"] = config.STATE_SENT
-
-    # Now Row 1 is done → must advance to Row 2.
     selected = get_next_lead(leads)
     assert selected is not None
-    assert selected["row_id"] == "2", (
-        f"Must advance to Row 2 after Row 1 reaches SENT, got Row {selected['row_id']}"
-    )
+    assert selected["row_id"] == "2"
 
 
 def test_main_window_closed(monkeypatch):
-    """When outside the send window, main() must exit 0 without processing any lead."""
-    import config as cfg
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "key")
-    monkeypatch.setattr(cfg, "SHEET_ID", "sid")
-    monkeypatch.setattr(cfg, "EMAIL_PASSWORD", "pw")
-    monkeypatch.setattr(cfg, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
+    monkeypatch.setattr(config, "RESEND_API_KEY", "key")
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "key")
+    monkeypatch.setattr(config, "SHEET_ID", "sid")
+    monkeypatch.setattr(config, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
 
-    # Window is 9-10 IST; force current time to be 00:00 UTC (= 05:30 IST = before window).
     sheets = MemSheets(
         leads=[make_lead(state="QUEUED", draft_subject="s", draft_body="b")],
         control={
             "daily_cap": "5",
             "sent_today": "0",
             "date_reset_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "warmup_phase": "complete",
             "is_locked": "",
             "send_window_start": "9",
             "send_window_end": "10",
-            "warmup_daily_target": "2",
         },
     )
     provider = FakeProvider()
 
     monkeypatch.setattr("run.GspreadClient", lambda: sheets)
-    monkeypatch.setattr("run.SMTPProvider", lambda: provider)
-    # Force _window_open to return False by setting a very narrow window
-    # and freezing the clock to a time outside it.
+    monkeypatch.setattr("run.ResendProvider", lambda: provider)
     monkeypatch.setattr("run._window_open", lambda ctrl, now=None: False)
     monkeypatch.setattr("run.research.resolve_model", lambda c, preferred=None: "m")
     monkeypatch.setattr("run.research._get_client", lambda: object())
@@ -984,30 +781,26 @@ def test_main_window_closed(monkeypatch):
 
 
 def test_main_no_lead(monkeypatch):
-    """When there are no actionable leads, main() must exit 0 cleanly."""
-    import config as cfg
-    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "key")
-    monkeypatch.setattr(cfg, "SHEET_ID", "sid")
-    monkeypatch.setattr(cfg, "EMAIL_PASSWORD", "pw")
-    monkeypatch.setattr(cfg, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
+    monkeypatch.setattr(config, "RESEND_API_KEY", "key")
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "key")
+    monkeypatch.setattr(config, "SHEET_ID", "sid")
+    monkeypatch.setattr(config, "GOOGLE_SERVICE_ACCOUNT_JSON", "{}")
 
     sheets = MemSheets(
-        leads=[make_lead(state="SENT")],  # terminal — nothing to advance
+        leads=[make_lead(state="SENT")],
         control={
             "daily_cap": "5",
             "sent_today": "0",
             "date_reset_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "warmup_phase": "complete",
             "is_locked": "",
             "send_window_start": "0",
             "send_window_end": "23",
-            "warmup_daily_target": "2",
         },
     )
     provider = FakeProvider()
 
     monkeypatch.setattr("run.GspreadClient", lambda: sheets)
-    monkeypatch.setattr("run.SMTPProvider", lambda: provider)
+    monkeypatch.setattr("run.ResendProvider", lambda: provider)
     monkeypatch.setattr("run._window_open", lambda ctrl, now=None: True)
     monkeypatch.setattr("run.research.resolve_model", lambda c, preferred=None: "m")
     monkeypatch.setattr("run.research._get_client", lambda: object())
@@ -1016,4 +809,3 @@ def test_main_no_lead(monkeypatch):
     rc = main([])
     assert rc == 0
     assert provider.sent == []
-

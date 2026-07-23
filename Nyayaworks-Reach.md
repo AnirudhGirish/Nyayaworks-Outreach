@@ -1,244 +1,200 @@
-# NyayaWorks Outreach Pipeline — Engineering Spec
+# NyayaWorks Outreach Pipeline — Engineering Spec & Architectural Record
 
-## 0. Setup Walkthrough — exactly what to do, in order, before the coding agent starts
+A comprehensive, production-grade technical specification and architectural record for the NyayaWorks cold-outreach automation engine (built for NyayaOS). This document details the system's setup, data model, state machine, resilience mechanisms, and full architectural evolution—from initial design choices to current production state.
 
-Do these six things yourself first. None of them require code — they're
-account/DNS/config setup. The coding agent builds against what you set up here.
+---
 
-### 0a. Google Sheets + Google Cloud
+## 0. Setup & Infrastructure Walkthrough
 
-1. Create the Sheet. Add three tabs: `leads` (schema in §4), `control`
-   (schema in §4/§8), and `warmup_peers` (schema in §8).
-2. Go to console.cloud.google.com → create a new project (e.g. `nyayaworks-outreach`).
-3. In the search bar at the top, search "Google Sheets API" → click **Enable**.
-4. Go to **IAM & Admin → Service Accounts → Create Service Account**. Name it
-   anything (e.g. `sheets-bot`). No project-level roles are needed — skip that step.
-5. Open the new service account → **Keys** tab → **Add Key → Create new key → JSON**.
-   This downloads a `.json` file. This *is* the credential the pipeline uses —
-   keep it, don't lose it, don't put it in git.
-6. Copy the service account's email (looks like
-   `sheets-bot@nyayaworks-outreach.iam.gserviceaccount.com`).
-7. Open your Sheet → **Share** → paste that email in → give it **Editor** access.
-8. Also add your partner's real Google account as a normal human **Editor** —
-   unrelated to the step above, just the usual "Share" flow.
+The outreach engine runs autonomously as a stateless scheduled job. Before deploying, configure account credentials, domain records, and secrets in order.
 
-### 0b. GoDaddy
+### 0a. Google Sheets & Google Cloud Platform
+1. **Google Sheet Setup:** Create a master Google Sheet. Header rows reside in Row 1. Required tabs:
+   - `leads`: Canonical schema (§4.1).
+   - `control`: System control values in Row 2 (§4.2).
+2. **GCP Project Setup:** Log into `console.cloud.google.com` $\rightarrow$ Create project `nyayaworks-outreach`.
+3. **Enable API:** Enable **Google Sheets API** under APIs & Services.
+4. **Service Account:** Create service account `sheets-bot@nyayaworks-outreach.iam.gserviceaccount.com`. No project roles required.
+5. **Key Generation:** Under **Keys** $\rightarrow$ **Add Key** $\rightarrow$ **Create new key (JSON)**. Download the JSON secret key. This value is passed directly via `GOOGLE_SERVICE_ACCOUNT_JSON`.
+6. **Sheet Permissions:** Share the master Google Sheet with the service account email as **Editor**.
 
-Confirmed from your screenshots: you're on **GoDaddy Professional Email,
-powered by Titan** (not Microsoft 365 — the "Manage email users" panel and
-lack of any Outlook/Microsoft branding confirms this). Exact server settings:
+### 0b. Domain & Authentication Strategy (`founder@reach.nyayaworks.in`)
+To protect root domain reputation while maintaining direct human email engagement, the pipeline uses a dedicated subdomain sending strategy paired with custom reply routing:
 
-- **SMTP (sending)**: `smtpout.secureserver.net`, port `465`, SSL
-- **IMAP (reading — for bounce/reply polling)**: `imap.secureserver.net`,
-  port `993`, SSL
+- **Sending Address:** `founder@reach.nyayaworks.in` (Outreach subdomain).
+- **Reply-To Address:** `founder@nyayaworks.in` (Main inbox on Titan / GoDaddy Professional Email).
+- **DNS Authentication Records (Cloudflare / GoDaddy DNS):**
+  - **SPF:** `v=spf1 include:resend.com ~all` configured on `reach.nyayaworks.in`.
+  - **DKIM:** Resend-generated TXT records added to `reach.nyayaworks.in` for cryptographic signing.
+  - **DMARC:** `v=DMARC1; p=none; rua=mailto:dmarc@nyayaworks.in` configured on `_dmarc.reach.nyayaworks.in`.
+- **IMAP Reply Monitoring:** Inbound replies to `founder@nyayaworks.in` are fetched via Titan IMAP (`imap.secureserver.net:993`, SSL-only).
 
-**On the subdomain question — here's exactly how it works and the decision
-to make:**
+### 0c. Resend API Setup
+1. Log into `resend.com` $\rightarrow$ Add and verify the domain `reach.nyayaworks.in`.
+2. Generate an API Key under **API Keys** with full sending permissions.
+3. Save as environment variable `RESEND_API_KEY`.
 
-An email address needs an actual *mailbox* (a paid account with its own
-login/storage) to send and receive from, plus its own SPF/DKIM/DMARC records
-authenticating that specific hostname. A subdomain doesn't inherit any of
-this automatically from the root domain. So `hi@reach.nyayaworks.in` is only
-possible if you either buy a second GoDaddy Professional Email seat
-(you saw "1 account available, Buy more" — check that price) and go through
-GoDaddy's setup to host mail on that subdomain, or you skip the subdomain
-and send from the mailbox you already have.
+### 0d. Anthropic API
+1. Log into `console.anthropic.com` $\rightarrow$ Billing $\rightarrow$ API Keys $\rightarrow$ Create key.
+2. Save as environment variable `ANTHROPIC_API_KEY`.
+3. At runtime, `research.py` queries `client.models.list()` to resolve the active `claude-3-5-sonnet` model variant.
 
-**Given this, here's my recommendation to keep you moving today:** default
-to sending from your existing mailbox (`founder@nyayaworks.in`) on the root
-domain. Zero extra cost, zero extra setup, and it's already yours. The
-downside is that if cold sending ever gets flagged, it could in theory
-affect deliverability for your other founder@ correspondence too — but
-given your volume (5–10/day), the guardrails already in this spec, and the
-warmup plan below, that risk is small and manageable. If you later want the
-subdomain's isolation, it's a config change (one `FROM_ADDRESS` variable),
-not a rebuild — set it up whenever it feels worth the extra mailbox cost.
+### 0e. Railway Deployment (Stateless Cron)
+1. Connect the GitHub repository to Railway.
+2. Configure environment variables in Railway project settings (never commit secrets to git).
+3. **Cron Schedule:** `0,30 3-12 * * 1-6` in UTC (covers 09:00 - 18:00 IST, Monday through Saturday).
+4. **Start Command:** `python run.py`.
+5. **Spending Cap:** Enable spending cap under Railway Billing to enforce a hard budget ceiling.
 
-1. Log into GoDaddy → **My Products** → find `nyayaworks.in` → **DNS** (or
-   "Manage DNS").
-2. Add SPF, DKIM, and DMARC records for the **root domain** (since we're
-   sending from `founder@nyayaworks.in` by default). GoDaddy's Professional
-   Email admin panel (under Email → Email Deliverability) generates the
-   exact DKIM record for you — copy its Host/Value into the DNS page here.
-3. DNS changes take up to 48 hours to fully propagate — do this today.
-4. If you later add the subdomain: repeat this for `reach.nyayaworks.in`
-   (or whichever you choose) once the second mailbox is set up, and update
-   `FROM_ADDRESS` in Railway.
+---
 
-### 0c. Railway
+## 1. Architectural Guarantees & Evolution
 
-1. Confirm your Hobby ($5/mo) plan is active, and create a GitHub repo for
-   this project (Railway deploys from GitHub).
-2. Create a new Railway Project, connect the GitHub repo. It'll deploy once
-   the coding agent has pushed code.
-3. Open the service → **Settings** tab → **Cron Schedule**. Enter a crontab
-   expression. Important: **Railway evaluates cron in UTC, not IST.** 9am–6pm
-   IST is roughly 3:30am–12:30pm UTC, so an expression like `0,30 3-12 * * 1-6`
-   (every 30 min, 3am–1pm UTC, Mon–Sat) covers your window with a little room
-   either side — double check with a cron expression validator before saving.
-4. In the same Settings tab, set the **Start Command** (e.g. `python run.py`).
-5. Go to the **Variables** tab and add every secret from §0a/§0d/§0f as an
-   environment variable (never commit these to the repo).
-6. Go to **Usage/Billing** and turn on the **spending cap** — this is the one
-   setting that puts a hard ceiling on cost no matter what a bug does.
-7. After the first few scheduled runs, check the **Deployments/Logs** tab to
-   confirm it actually ran and the Sheet updated as expected.
+### 1.1 Architectural Guarantees
+- **Stateless & Idempotent:** State resides entirely in Google Sheets. If a cron execution terminates unexpectedly mid-run, the next scheduled invocation evaluates Sheet state and resumes without duplication or state drift.
+- **Strict Row-Sequential Vertical Processing:** Leads advance vertically row-by-row through their full lifecycle (`NEW` $\rightarrow$ `RESEARCHED` $\rightarrow$ `DRAFTED` $\rightarrow$ `QUEUED` $\rightarrow$ `SENT`) before subsequent rows are picked up. This prevents resource starvation on in-flight leads and ensures daily send capacities yield completed dispatches rather than stranded drafts.
+- **Double-Gated Delivery:** Every email draft must pass automated validation checks (word count, banned phrases, unsubscribe URL, notable fact usage) both at drafting time and at the literal millisecond prior to API dispatch (`_refetch_lead`).
+- **Zero Lock Contention Leaks:** System locks in `control.is_locked` use ISO UTC timestamps with a 15-minute Time-To-Live (TTL). Crashed containers cannot lock the engine permanently; lock release is guaranteed via `try...finally` blocks in `run.py`.
 
-### 0d. AI (Anthropic)
+### 1.2 Architectural Evolution & Historical Rationale
 
-1. Go to console.anthropic.com → sign up / log in → set up billing.
-2. **API Keys → Create Key** → copy it immediately (it's shown once) → this
-   becomes the `ANTHROPIC_API_KEY` Railway variable in §0c.
-3. That's it — this one key covers both the research step and the drafting
-   step below. No second AI account needed.
+#### Transport Layer: SMTP $\rightarrow$ Resend HTTPS API
+- **Original Design:** Raw SSL SMTP via `smtplib` (`smtpout.secureserver.net:465`) and RFC 3464 MIME bounce parsing (`bounce_detection.py`).
+- **Why We Refactored:** Raw SMTP connections lacked native idempotency headers, presented socket timeout risks, required complex MIME parsing for non-standard provider non-delivery reports (NDRs), and risked double-sends if network blips occurred mid-session.
+- **Current Production State:** `ResendProvider` dispatches via Resend's HTTPS API using the official `resend` Python SDK. Dispatches include `options={"idempotency_key": f"{row_id}_{attempts}"}` to guarantee idempotency. Status tracking relies on Resend API event polling (`GET /emails/{id}`).
 
-### 0e. Research
+#### Warmup System Lifecycle: Peer-to-Peer Warmup $\rightarrow$ Production-Only Engine
+- **Original Design:** Automated peer-to-peer warmup module (`warmup.py`, `warmup_peers` tab, ramp-up volume gates) scripting simulated two-way AI conversations.
+- **Why We Refactored:** Once initial domain reputation was established and volume stabilized, peer-to-peer warmup became redundant compute overhead.
+- **Current Production State:** `warmup.py` and warmup execution gates were completely removed to keep the pipeline lightweight and production-focused. Legacy `warmup_peers` tabs or unused control columns in existing spreadsheets are safely ignored by the active codebase.
 
-This is simpler than it sounds — skip building a scraper entirely. Claude's
-API has a **native web search tool**: you add one parameter to the same API
-call (`tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]`)
-and Claude searches the web itself, reads the results, and returns them —
-using the same `ANTHROPIC_API_KEY` from §0d. No separate search API account,
-no scraping library to maintain, no extra bill beyond a small per-search fee
-(negligible at your volume). This *is* the research step — feed it the
-research prompt in §6a pointed at the firm's name and website.
+#### Email Presentation: Rich Card Design $\rightarrow$ Primary-First Minimalist Engine
+- **Original Design:** Styled HTML emails featuring dark header banners (`"NyayaOS | Legal Workspace"`), card borders, background colors, and styled CTA buttons.
+- **Why We Refactored:** Rich template wrappers, heavy table nesting, and styled button blocks trigger Gmail and Outlook "Promotions" tab classification algorithms.
+- **Current Production State:** `template.py` implements a minimalist "Primary-First" HTML engine mimicking personal 1-to-1 executive communications written in Apple Mail or Outlook. Heavy table wrappers, card borders, hero banners, and button blocks were removed in favor of system typography and subtle inline text links.
 
-### 0f. Sending / delivery (SMTP, in-house — decision made)
+---
 
-1. Server settings (confirmed, §0b): SMTP `smtpout.secureserver.net:465`
-   (SSL), IMAP `imap.secureserver.net:993` (SSL) → Railway variables
-   `SMTP_HOST`, `SMTP_PORT`, `IMAP_HOST`, `IMAP_PORT`, `EMAIL_USER`,
-   `EMAIL_PASSWORD` (an app-specific password if your account has 2FA).
-2. **For automated warmup (§12), you need 1–2 mailboxes you control** —
-   your own personal Gmail, your partner's, or similar — with IMAP access
-   enabled (an app password for each). The pipeline will script both sides
-   of a conversation between your sending mailbox and these peers. This
-   can't be fully automated from nothing; you still have to supply the
-   "other end" of the conversation. Add each as `WARMUP_PEER_1_EMAIL` /
-   `WARMUP_PEER_1_APP_PASSWORD` etc. in Railway.
-3. Run every lead's email through a verifier (Hunter or NeverBounce)
-   *before* it's added to the Sheet — this is what keeps bounce rate low
-   regardless of anything else in this spec.
+## 2. System Architecture & Flow Control
 
-Once all six are done, hand §10's master prompt to the coding agent.
-
-## 1. Goals & Non-Goals
-
-**Goals**
-- Pick leads from a Google Sheet, research them, draft a personalized email, send it, and log status back — reliably, forever, with zero manual babysitting.
-- Never send twice. Never send to someone who opted out. Never send a hallucinated claim.
-- Every failure is visible and retryable, never silent.
-
-**Non-Goals (explicitly out of scope)**
-- No custom UI. The Sheet *is* the UI.
-- No open-tracking pixels (unreliable since Apple MPP, and a spam signal in themselves).
-- No multi-channel (LinkedIn/WhatsApp) yet — add later only if this proves out.
-- No n8n / visual workflow tool — see reasoning above. This is a single, testable codebase.
-
-## 2. Architecture
-
-**One service. No always-on component.** On Railway's $5 Hobby plan, a container
-that runs 24/7 (like a webhook receiver) burns compute every idle minute — a
-minimal always-on service can eat most of your $5 credit on its own, per
-Railway's own pricing docs. A Cron Job only bills for the seconds it actually
-runs, so a single cron-triggered script is both simpler *and* the right
-architecture for this budget — not just a compromise.
+### 2.1 Macro Lifecycle Flow
 
 ```
-Railway Cron Job (every 30 min, 9am–6pm IST, Mon–Sat)
-  → run.py (single stateless invocation, exits when done)
-      1. sync_status()               — poll for bounces/replies on any row in
-                                        SENT state (IMAP poll, or the send
-                                        provider's status API), update rows
-      2. check_daily_cap()           — read/increment a counter row in the sheet
-      3. get_next_lead()             — pull one row in the earliest actionable state
-      4. advance(lead)                — run exactly ONE stage transition, then exit
-      5. write_back(lead)             — persist new state + data to the row
+Railway Cron Schedule (UTC: 0,30 3-12 * * 1-6)
+│
+├──► Preflight Check (Verify RESEND_API_KEY, ANTHROPIC_API_KEY, SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON)
+│
+├──► Lock Acquisition (control.is_locked check & TTL evaluation)
+│      ├── Lock Active & Unexpired (<15m) ──► Exit (Code 0)
+│      └── Lock Free or Expired           ──► Acquire Lock (Write ISO UTC timestamp)
+│
+├──► Status & Inbox Synchronization (sync_status)
+│      ├── Resend API Event Polling (delivered, bounced, complained, suppressed)
+│      └── IMAP Reply Monitoring (Inbound emails from leads ──► Update SENT → REPLIED)
+│
+├──► Daily Cap & Send Window Evaluation
+│      ├── Cap Reached / Window Closed ──► Release Lock ──► Exit (Code 0)
+│      └── Cap & Window Open           ──► Process Next Actionable Lead
+│
+└──► Lock Release (Executed inside guaranteed finally block)
 ```
 
-No webhooks, no always-on receiver, no second service to secure or pay for.
-Bounce/reply detection is just another polling step inside the same script —
-slightly less instant than a webhook, but "checked every 30 minutes" is more
-than fine for cold outreach, and it keeps the entire system to one deployable
-unit that either runs correctly or doesn't run at all.
+### 2.2 Vertical State Machine Progression
 
-Each invocation does **one stage for one lead**, then exits. This is deliberate:
-a crashed long-running daemon fails silently; a cron job that fails just doesn't
-advance that one lead, and the next run picks up cleanly. No internal scheduler,
-no background threads, nothing that can wedge.
+Leads transition through a strictly monotonic state machine. A single lead record must progress sequentially through all intermediate states to reach completion.
 
-## 3. Tech Stack
+```
+[ NEW ] ──► [ RESEARCHED ] ──► [ DRAFTED ] ──► [ QUEUED ] ──► [ SENT ]
+│               │               │               │
+└───────────────┴───────────────┴───────────────┴──► [ FAILED ] / [ SUPPRESSED ]
+```
 
-- **Language**: Python 3.12 (matches your stack, best Sheets/LLM SDK support)
-- **Sheets**: `gspread` + a Google service account (key stored as a Railway
-  secret, never in the repo). Batch reads/writes — don't call the API once
-  per field — to stay well clear of rate limits.
-- **LLM**: `anthropic` SDK, structured JSON output (see prompts below). Don't
-  hardcode a specific model string in the code — have the coding agent check
-  the current model list at build time. Models get deprecated on Anthropic's
-  own schedule, not yours.
-- **Web fetch for research**: Claude's native `web_search` tool — no separate
-  scraping library or search API needed (see §0e)
-- **Sending & status**: an abstract `SendProvider` interface, two implementations:
-  - `SMTPProvider` (chosen for now — raw SMTP send via `smtplib`, IMAP poll via
-    `imaplib` for bounces/replies on the same inbox). **Both connections must
-    use `ssl.create_default_context()`** — non-negotiable, no exceptions for
-    convenience during testing.
-  - `SmartleadProvider` (not built now, but the interface leaves room for it —
-    if bounce-parsing edge cases ever eat real time, this is a small swap,
-    not a rebuild)
-- **Deploy**: Railway, **one service** — the Cron Job. Nothing always-on.
-- **Tests**: `pytest`, with fixture-based tests for every stage transition
+| State | Trigger | Operation Performed | Next State |
+|---|---|---|---|
+| `NEW` | Scheduled Run | Deep web research and context extraction via LLM with web search | `RESEARCHED` |
+| `RESEARCHED` | Scheduled Run | Personalized copy generation using research JSON and template | `DRAFTED` |
+| `DRAFTED` | Scheduled Run | Deterministic guardrail validation (length, banned terms, unsubscribe link) | `QUEUED` |
+| `QUEUED` | Scheduled Run | Live DNC refetch, duplicate check, HTML rendering, Resend dispatch | `SENT` |
+| `SENT` | Sync Status | Resend event polling (`bounced`/`complained`/`suppressed`) or IMAP reply check | `BOUNCED` / `REPLIED` |
+| `SUPPRESSED` | Any Point | Forced terminal state if `do_not_contact == TRUE` | Terminal |
+| `FAILED` | Any Point | Reached `MAX_ATTEMPTS` (3) due to persistent errors | Terminal |
 
-## 4. Data Model — Sheet Schema
+---
 
-| Column | Notes |
+## 3. Resilience, Error Boundaries & Safety Mechanisms
+
+### 3.1 Network Timeout & Retry Matrix
+
+All external network operations enforce strict HTTP and socket timeouts to prevent process hanging.
+
+| Boundary | Interface | Timeout | Failure Behavior |
+|---|---|---|---|
+| **Google Sheets API** | `gspread` Client (`gc.set_timeout`) | 30 seconds | Trapped by execution boundary; logged to `control.last_error`. Container exits cleanly. |
+| **LLM Research & Draft** | Anthropic Client SDK | 60 seconds | Exception caught. Lead `attempts` counter incremented. Message logged to lead `error_log`. |
+| **Resend API Dispatch** | Resend Python SDK | 30 seconds | Email retained in `QUEUED` state. `attempts` counter incremented. Error logged. |
+| **IMAP Reply Sync** | `imaplib.IMAP4_SSL` | 30 seconds | Failure logged to `control.last_error`. Non-fatal; execution proceeds to lead processing. |
+
+### 3.2 Last-Millisecond Do-Not-Contact (DNC) Gate
+To eliminate the risk of emailing a recipient who unsubscribed or was manually suppressed while a draft was pending in the queue:
+1. When a lead reaches the `QUEUED` state and is selected for dispatch, the system bypasses in-memory caches and re-fetches the fresh row directly from the Google Sheet (`_refetch_lead`).
+2. If `do_not_contact` has been set to `TRUE`, the transmission is aborted instantly, and the record transitions directly to `SUPPRESSED`.
+
+### 3.3 Duplicate Email Prevention
+Before any message is passed to Resend, the state machine executes an explicit search across the entire dataset (`_has_duplicate_sent`). If another record with an identical email address exists in state `SENT`, `REPLIED`, or `BOUNCED`, the current record is immediately marked `FAILED` with a duplicate warning in the error log.
+
+### 3.4 HTML Escaping & Compliance Footer
+To ensure safe rendering across all web and mobile email clients:
+- All dynamic subject lines, lead names, firm names, and AI-generated paragraphs are strictly HTML-escaped (`html.escape()`).
+- Unsubscribe links (`https://nyayaworks.in/unsubscribe?email={escaped_email}`) and brand footers are deterministically rendered into responsive table-based layouts.
+- Resend dispatches both rendered HTML and raw plain-text fallback as `multipart/alternative`.
+
+---
+
+## 4. Google Sheet Data Schema
+
+The database contains two active operational worksheets (headers in Row 1):
+
+### 4.1 `leads` Tab
+| Column Name | Type | Description |
+|---|---|---|
+| `row_id` | String / Integer | Unique record identifier |
+| `name` | String | Target recipient full name |
+| `firm_name` | String | Organization or law firm name |
+| `type` | String | Firm categorization (e.g., Law Firm, Corporate) |
+| `website` | String | Fully qualified target URL for research |
+| `email` | String | Target email address |
+| `source` | String | Lead generation source tag |
+| `state` | Enum String | Current lifecycle state (`NEW`, `RESEARCHED`, `DRAFTED`, `QUEUED`, `SENT`, `BOUNCED`, `REPLIED`, `SUPPRESSED`, `FAILED`) |
+| `research_json` | JSON String | Extracted firm context and structured research |
+| `draft_subject` | String | Generated email subject line |
+| `draft_body` | String | Generated email message body |
+| `provider_message_id` | String | Resend email ID (UUID) |
+| `sent_at` | ISO Timestamp | UTC timestamp of successful Resend dispatch |
+| `last_updated_at` | ISO Timestamp | UTC timestamp of last state mutation |
+| `attempts` | Integer | Consecutive failure count (max 3) |
+| `error_log` | String | Last recorded exception or validation failure |
+| `do_not_contact` | Boolean (`TRUE`/`FALSE`) | Hard suppression flag |
+
+### 4.2 `control` Tab
+Row 1 contains column headers; Row 2 contains active runtime values.
+
+| Column Name | Description |
 |---|---|
-| `row_id` | stable UUID, never reused |
-| `name`, `firm_name`, `type`, `website`, `email` | lead data |
-| `source` | `manual` \| `scraped` |
-| `state` | see state machine below |
-| `research_json` | full research object, stored for audit — never re-derive silently |
-| `draft_subject`, `draft_body` | stored before send, so a send failure never loses the draft |
-| `provider_message_id` | for bounce/reply correlation |
-| `sent_at`, `last_updated_at` | timestamps |
-| `attempts` | retry counter per stage |
-| `error_log` | last error message, human-readable |
-| `do_not_contact` | boolean — **checked before every single stage**, independent of state |
+| `daily_cap` | Maximum allowed email dispatches per calendar day |
+| `sent_today` | Count of emails dispatched during the current UTC date |
+| `date_reset_at` | UTC date string tracking the last counter reset (`YYYY-MM-DD`) |
+| `send_window_start` | Allowed send window start hour in IST (e.g., `9`) |
+| `send_window_end` | Allowed send window end hour in IST (e.g., `18`) |
+| `is_locked` | Empty string when free; ISO UTC timestamp when locked |
+| `last_error` | System-level error message display for administrative visibility |
 
-A separate **`control`** sheet tab holds: `daily_cap`, `sent_today`, `date_reset_at`,
-`send_window_start`, `send_window_end`, **`is_locked`** (a timestamp), and the
-warmup fields added in §8 (`warmup_phase`, `warmup_started_at`,
-`warmup_daily_target`) — so you change the ramp by editing a cell, never by
-redeploying code. A third tab, `warmup_peers`, is also added per §8.
+*(Note: Legacy spreadsheet columns such as `warmup_phase` or legacy `warmup_peers` tabs may physically exist in historical Google Sheets, but are ignored by the active codebase.)*
 
-**Race-condition guard:** on wake, `run.py` checks `is_locked`. If it's set and
-less than ~15 minutes old, the run exits immediately — a previous run is still
-in flight (e.g. a slow API call made it run long). Otherwise it writes the
-current timestamp to `is_locked` and clears it before exiting. This is what
-stops two overlapping runs from grabbing the same lead and double-sending.
+---
 
-## 5. State Machine
+## 5. AI Prompts & Guardrails
 
-```
-NEW → RESEARCHED → DRAFTED → QUEUED → SENT → REPLIED
-                                          ↘ BOUNCED
-any state → FAILED (after N attempts; requires human review to re-queue)
-any state → SUPPRESSED (terminal, if do_not_contact = true)
-```
-
-Rules:
-- A row only ever moves **one stage forward per cron run**. This bounds the blast
-  radius of any single bug.
-- Before every transition: check `do_not_contact`. If true, force state to
-  `SUPPRESSED` and stop, regardless of what state it was in.
-- Before `QUEUED → SENT`: hard gate — verify the email passed the guardrail
-  checks in §7. No draft reaches the send provider unvalidated.
-
-## 6. AI Prompts (runtime — these run per-lead, not by the coding agent)
-
-### 6a. Research prompt
-
+### 5.1 Research Prompt (`research.py`)
 ```
 You are a research assistant preparing a factual briefing note for a single
 B2B outreach email. You will be given a lead's name, firm name, and website
@@ -266,8 +222,7 @@ Output strictly as JSON, no other text:
 }
 ```
 
-### 6b. Drafting prompt
-
+### 5.2 Drafting Prompt (`research.py`)
 ```
 You are drafting ONE cold outreach email on behalf of NyayaOS to a lawyer,
 law firm, or legal council. You are given a fixed template, a research
@@ -293,208 +248,23 @@ Output strictly as JSON, no other text:
 { "subject": string, "body": string }
 ```
 
-## 7. Guardrails (hard gate before send — code, not AI)
+### 5.3 Deterministic Guardrails (`guardrails.py`)
+Run as pure Python functions before moving a draft to `QUEUED`:
+- Unsubscribe link present (`nyayaworks.in/unsubscribe`)
+- Body word count under cap (`BODY_WORD_CAP = 120`, excluding mandatory unsubscribe block)
+- No banned spam phrases (`config.BANNED_PHRASES`)
+- `notable_fact` used in body only if `confidence == "high"`
+- Recipient `do_not_contact` is `False`
 
-Run these checks in code on every drafted email before it can move to `QUEUED`:
-- Unsubscribe link present and correct
-- Body word count under the cap
-- No banned phrases (spam trigger words list, maintained in config)
-- `notable_fact` used in body only if `confidence == "high"` — reject and
-  regenerate with fallback if this doesn't hold
-- Recipient not on `do_not_contact` / suppression list (re-check even if
-  already checked earlier — defense in depth)
+---
 
-If any check fails: state → `FAILED`, `error_log` populated, never silently
-skipped or silently sent anyway.
+## 6. Known Accepted System Risks & Recovery Procedures
 
-## 8. Automated Warmup Module (best-effort, not a silver bullet)
-
-**Be clear-eyed about what this is:** a script conversing between mailboxes
-you control is a genuine, real signal to Gmail/Outlook, but it's a weaker
-signal than a dedicated warmup service with thousands of seed accounts. This
-gets you real warmup, not the same strength as a paid tool. If inbox
-placement is still poor after this, that's the sign to reconsider Smartlead
-— not a failure of this design.
-
-**New `control` fields**: `warmup_phase` (`active` | `complete`),
-`warmup_started_at`, `warmup_daily_target` (ramps 2 → 15 over ~3 weeks).
-
-**New `warmup_peers` tab**: `peer_email`, `imap_host`, `app_password_env_var`
-(name of the Railway variable, never the password itself), `last_sent_at`,
-`last_received_at`.
-
-**Mechanism**, run as an extra step inside the same `run.py` invocation:
-1. While `warmup_phase == active`: **no cold leads are processed at all** —
-   this is a hard gate, not a suggestion.
-2. On a randomized subset of ticks, send a short, natural, non-templated
-   message (generated by Claude with a distinct "warmup" system prompt —
-   varied phrasing, never identical twice) from the sending mailbox to a
-   randomly chosen peer.
-3. On other ticks, check each peer's inbox via IMAP for an unanswered
-   warmup message, and send a natural-sounding reply back — scripting both
-   sides of a real conversation, with randomized delay (never instant).
-4. `warmup_started_at` + elapsed days + a manual `warmup_phase = complete`
-   flip (you check deliverability looks healthy first) — not just a timer
-   — moves the pipeline into cold-sending mode.
-5. **Warmup traffic continues indefinitely at a low trickle (1–2/day) even
-   after cold sending starts** — reputation needs ongoing positive signal,
-   not a one-time push.
-
-## 9. Bounce Detection — Hardened
-
-Bounces don't look like normal replies, and getting this wrong either hides
-real delivery failures or misclassifies real human replies as bounces. On
-every `sync_status()` poll:
-1. Fetch new messages in the mailbox's inbox since the last poll.
-2. Flag as a **candidate bounce** if the sender is `mailer-daemon@`,
-   `postmaster@`, or the Content-Type is `multipart/report` /
-   `message/delivery-status` (per RFC 3464) — not just a keyword match on
-   the subject line, which misses most real bounce formats.
-3. Parse the `message/delivery-status` part for the `Action:` field
-   (`failed` = hard bounce, `delayed` = not yet a bounce, leave as SENT) and
-   the original recipient address to correlate back to a lead row.
-4. Correlate to a lead via the stored `provider_message_id` (match against
-   `Original-Message-ID` in the delivery-status part) — fall back to
-   matching the recipient's email address if the ID isn't present.
-5. A message that **doesn't** match the bounce pattern above but comes from
-   the lead's own email address → `REPLIED`, not `BOUNCED`. Don't guess
-   intent from the reply body (e.g. don't auto-set `do_not_contact` just
-   because it contains a word like "remove") — flag it for you to read and
-   decide, since that nuance isn't safe to automate.
-
-## 10. Deliverability Config
-
-- Sending from `founder@nyayaworks.in` by default (see §0b) — SPF/DKIM/DMARC
-  configured on the root domain
-- Automated warmup per §8 must reach `warmup_phase = complete` before any
-  cold lead is processed
-- Verify emails (Hunter/NeverBounce) before they ever reach `NEW`
-- `control.daily_cap` starts at 5, manually raised weekly as bounce rate
-  stays under ~2–3% and inbox placement holds
-- Send window: 9am–6pm IST, skip Sundays
-
-## 11. Railway Deployment & Cost
-
-- **One Cron Job service**, nothing else always-on. At your volume (a few
-  seconds of work every 30 minutes, working hours only, 6 days a week), actual
-  compute usage is a small fraction of the $5 Hobby credit — realistically
-  cents per month, not dollars.
-- **Set a hard spending cap.** Railway supports an opt-in spending limit —
-  turn this on. It's the single best protection against any bug (a runaway
-  retry loop, a misconfigured schedule) turning into a surprise bill. Without
-  it, overage is billed automatically with no ceiling.
-- **All secrets as Railway environment variables**: Anthropic API key, Google
-  service account JSON (as a variable, not a committed file), SMTP/IMAP
-  credentials, warmup peer credentials. Never in the git repo, never in
-  code, never logged.
-- **Check the Railway usage dashboard weekly for the first month** to confirm
-  actual spend matches expectations before treating it as "set and forget."
-
-## 12. Testing Strategy
-
-- Unit tests for every stage function with saved fixture inputs/outputs
-  (a `low confidence` research fixture, a `high confidence` one, a
-  malformed-JSON-from-LLM fixture to prove the guardrail catches it)
-- A `--dry-run` flag that runs the full pipeline except the actual send
-  call, for safe end-to-end testing against a test sheet
-- One integration test that runs the whole state machine start-to-finish
-  against a mocked Sheet and mocked LLM/send provider
-
-## 13. Master Prompt — hand this to the coding agent
-
-```
-Build the NyayaWorks outreach pipeline exactly as specified in this
-document: [paste this whole spec].
-
-Implement it as:
-- run.py — single stateless entrypoint. On each run: check `control.is_locked`
-  first — if set and under ~15 minutes old, exit immediately (another run is
-  still in flight). Otherwise set the lock, call sync_status() (§9), then
-  either run one warmup step (§8, if warmup_phase == active) OR run ONE
-  stage transition for ONE lead (§2 and §5, if warmup_phase == complete),
-  then clear the lock before exiting. No webhook server, no long-running
-  process — this deploys as a Railway Cron Job only.
-- An SMTPProvider class: SMTP via smtplib to smtpout.secureserver.net:465
-  (SSL), IMAP via imaplib to imap.secureserver.net:993 (SSL) — both using
-  ssl.create_default_context(), no exceptions. Build it behind a
-  SendProvider abstract interface so a future provider can be swapped in
-  without touching business logic, but only implement SMTPProvider now.
-- bounce_detection.py — implement §9 exactly: MIME-aware parsing of
-  multipart/report and message/delivery-status parts per RFC 3464, not
-  keyword-matching on subject lines. Include unit tests with real sample
-  bounce MIME messages as fixtures.
-- warmup.py — implement §8: gated hard-stop on cold-lead processing while
-  warmup_phase == active, scripted two-way conversation with peer mailboxes
-  using varied AI-generated content, randomized send/reply delay.
-- sheets.py — all Google Sheets I/O, schema per §4 plus the warmup_peers
-  tab and control fields in §8, using batched reads/writes rather than one
-  API call per field
-- research.py, draft.py — LLM calls using the exact prompts in §6, using
-  whichever current Claude model is available at build time (don't hardcode
-  a version), parsing/validating JSON output (raise, don't guess, if it
-  doesn't match the schema)
-- guardrails.py — every check in §7, as pure functions with unit tests
-- Full pytest suite per §12 before considering this done
-- A README covering local dev, the Railway Cron Job setup, setting the
-  Railway spending cap, all required environment variables (list them
-  explicitly, grouped by module), and how to raise control.daily_cap safely
-
-Non-negotiables: no silent failures, no fabricated content ever reaches
-a send call, every external call (Sheets, LLM, SMTP/IMAP) has explicit
-error handling that writes to error_log rather than crashing the whole
-run, no secrets ever committed to the repo, no overlapping runs (the lock
-must actually be enforced), no cold lead is ever processed while
-warmup_phase == active. Ask me before making any architecture decision
-not covered in this spec.
-```
-
-## 14. How It All Works, End to End
-
-**A single run, in plain terms.** Every 30 minutes during working hours,
-Railway starts a short-lived container, it runs `run.py`, and the container
-disappears. That one run: checks a couple of rows for bounce/reply updates,
-checks whether today's send cap is used up, and — if not — moves exactly one
-lead one step forward (research it, or draft its email, or send it). Then it
-exits. Nothing is ever "running" in the background between ticks. If Railway
-itself has a bad five minutes, you simply lose one tick — nothing crashes,
-nothing is lost, because the Sheet (not memory) is the only source of truth.
-
-**Why nothing breaks.**
-- Every lead's progress lives in the Sheet as an explicit state, so a crash
-  mid-run just means that one row didn't advance this tick — it's retried
-  next tick, never duplicated, never lost.
-- A row only ever moves one step per run, so the worst a bug can do is stall
-  one lead in one state, not corrupt the whole pipeline.
-- A `FAILED` state (after a few retries) stops and waits for you rather than
-  looping forever or sending something unvalidated.
-- The daily cap is enforced in the Sheet itself, so even a scheduling bug
-  that somehow ran the cron every minute couldn't blow past your ramp.
-
-**Why nothing gets sent that shouldn't.**
-- The drafting AI can only use facts you've verified are true (`product_facts`)
-  and facts it actually found about the firm — never invented ones.
-- A separate, deterministic code check (not the AI) gates every email before
-  it can be sent: unsubscribe link present, length limit respected, no banned
-  phrases, suppression list re-checked one more time right before send.
-- `do_not_contact` is checked before *every* stage, not just before sending —
-  so someone who opts out mid-pipeline can't accidentally get a later-stage
-  email anyway.
-
-**Why it's secure.**
-- The Google service account can only see the one Sheet you shared with it —
-  not your Drive, not your other Sheets.
-- Every credential (Anthropic key, Google service account, SMTP/Smartlead
-  creds) lives as a Railway environment variable, never in the code or the
-  git repo.
-- There's no inbound webhook endpoint at all, so there's nothing on the
-  public internet for anyone to probe or spoof — status updates are pulled
-  by your own script, not pushed in by anyone else.
-- A Railway spending cap means even a runaway bug has a hard financial
-  ceiling, not an open-ended one.
-
-**What you actually own vs. what the tool owns.** You own: the Sheet (data),
-the code (git repo), the prompts (§6), and the product facts. The sending
-provider owns only deliverability infrastructure (warmup, DNS, IP reputation)
-and can be swapped without touching your logic, because of the SendProvider
-abstraction in §3. Nothing about your lead data or your pipeline logic is
-locked into any vendor.
+1. **`attempts` Counter Behavior:**
+   - `attempts` increments on every transition attempt (including `NEW` $\rightarrow$ `RESEARCHED`, `RESEARCHED` $\rightarrow$ `DRAFTED`, `DRAFTED` $\rightarrow$ `QUEUED`, `QUEUED` $\rightarrow$ `SENT`).
+   - A lead at state `QUEUED` has `attempts = 3`. If a single transient network error occurs during Resend dispatch, `attempts` reaches 4 ($\ge \text{MAX\_ATTEMPTS}=3$) and the lead transitions to `FAILED`.
+   - **Recovery Procedure:** Manually edit the Google Sheet row, setting `state = NEW` and `attempts = 0`.
+2. **Partial Failure Duplicate Send Window:**
+   - If Resend API dispatch succeeds but the subsequent Google Sheets write (`batch_update_leads`) fails, the lead remains `QUEUED` in storage. The next run re-dispatches to the recipient. (Mitigated by Resend's `Idempotency-Key` header).
+3. **Extended Upstream Outage Progression:**
+   - During multi-hour API outages, consecutive cron runs will attempt active leads until `MAX_ATTEMPTS` is reached. Leads will require manual state reset after service restoration.

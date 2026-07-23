@@ -27,13 +27,11 @@ SHEET_ID = os.environ.get("SHEET_ID", "")
 
 LEADS_TAB = os.environ.get("LEADS_TAB", "leads")
 CONTROL_TAB = os.environ.get("CONTROL_TAB", "control")
-WARMUP_PEERS_TAB = os.environ.get("WARMUP_PEERS_TAB", "warmup_peers")
 
 # ---------------------------------------------------------------------------
-# SMTP / IMAP (Titan / GoDaddy Professional Email — SSL only)
+# Resend API & IMAP (Titan for inbound reply polling — SSL only)
 # ---------------------------------------------------------------------------
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtpout.secureserver.net")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 IMAP_HOST = os.environ.get("IMAP_HOST", "imap.secureserver.net")
 IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
 EMAIL_USER = os.environ.get("EMAIL_USER", "founder@nyayaworks.in")
@@ -53,7 +51,7 @@ ANTHROPIC_MAX_TOKENS = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "1024"))
 # ---------------------------------------------------------------------------
 # Network timeouts (seconds) — configurable via env, with strict defaults
 # ---------------------------------------------------------------------------
-SMTP_TIMEOUT = int(os.environ.get("SMTP_TIMEOUT", "30"))
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "30"))
 IMAP_TIMEOUT = int(os.environ.get("IMAP_TIMEOUT", "30"))
 ANTHROPIC_TIMEOUT = int(os.environ.get("ANTHROPIC_TIMEOUT", "60"))
 SHEETS_TIMEOUT = int(os.environ.get("SHEETS_TIMEOUT", "30"))
@@ -171,18 +169,7 @@ CONTROL_COLUMNS = [
     "send_window_start",
     "send_window_end",
     "is_locked",
-    "warmup_phase",
-    "warmup_started_at",
-    "warmup_daily_target",
     "last_error",
-]
-
-WARMUP_PEERS_COLUMNS = [
-    "peer_email",
-    "imap_host",
-    "app_password_env_var",
-    "last_sent_at",
-    "last_received_at",
 ]
 
 # State machine constants
