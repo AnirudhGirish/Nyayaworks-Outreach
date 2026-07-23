@@ -28,7 +28,7 @@ jobs:
 
       - name: Run Ruff Linter
         run: |
-          ruff check . --exclude .venv
+          .venv/bin/ruff check .
 
       - name: Run Mypy Type Checker
         run: |

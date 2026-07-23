@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "RUF", "BLE", "TRY", "S", "FURB", "SIM"]
+ignore = [
+    "E501",   # Line too long
+    "TRY003", # Long exception messages outside exception class
+    "TRY300", # Move return to else block
+    "TRY301", # Abstract raise to an inner function
+    "SIM105", # Use contextlib.suppress instead of try-except-pass
+    "SIM108", # Use ternary operator instead of if-else
+    "RUF043", # Metacharacters in regex pattern
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # Allow assert in test files
+"verify_run.py" = ["S101", "BLE001"]

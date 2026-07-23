@@ -9,9 +9,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import ClassVar
 
+import pytest
+
 import config
 import guardrails
-import pytest
 import research
 import template
 from providers import SendProvider
@@ -211,8 +212,7 @@ def test_html_escaping_xss():
     bad_body = "We noticed <img src=x onerror=alert('xss_body')> in your practice."
     bad_email = "test+xss@example.com"
 
-    html_out, text_out = template.render(bad_subject, bad_body, bad_email, recipient_name="<b style='color:red'>Hacker</b>")
-
+    html_out, _ = template.render(bad_subject, bad_body, bad_email, recipient_name="<b style='color:red'>Hacker</b>")
     # Verify raw script/img tags do NOT appear in the rendered HTML
     assert "<script>" not in html_out
     assert "<img src=x" not in html_out
@@ -224,7 +224,7 @@ def test_html_escaping_xss():
 
 
 def test_plaintext_fallback_generated():
-    html_out, text_out = template.render("Subject Line", "Body content paragraph.", "user@firm.com")
+    _, text_out = template.render("Subject Line", "Body content paragraph.", "user@firm.com")
     assert text_out
     assert "Body content paragraph." in text_out
     assert "https://nyayaworks.in/unsubscribe?email=user%40firm.com" in text_out

@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 import config
-from sheets import GspreadClient
 import state_machine
+from sheets import GspreadClient
 
 load_dotenv()
 
@@ -22,7 +22,7 @@ def verify_pipeline():
     try:
         sheets = GspreadClient()
         print("✔ Sheets Client initialized successfully.")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"❌ Failed to initialize Sheets Client: {exc}")
         return
 
@@ -34,7 +34,7 @@ def verify_pipeline():
         print(f"Sent Today          : {control.get('sent_today')}")
         print(f"Is Locked           : {control.get('is_locked')}")
         print(f"Last Error          : {control.get('last_error') or 'None'}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"❌ Failed to read control tab: {exc}")
         return
 
