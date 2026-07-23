@@ -1,4 +1,4 @@
-"""Pytest suite for the NyayaWorks pipeline (§12).
+""""Pytest suite for the NyayaWorks pipeline (§12).
 
 Covers: guardrails, Resend status polling, HTML template rendering & XSS escaping,
 state-machine transitions, research/draft JSON parsing, and full integration runs.
@@ -6,19 +6,21 @@ No network required (mocked API backends).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import ClassVar
 
 import config
 import guardrails
+import pytest
 import research
 import template
 from providers import SendProvider
 from run import (
     _acquire_lock,
+    _maybe_reset_daily_cap,
     _preflight_credentials,
     _release_lock,
     _window_open,
-    _maybe_reset_daily_cap,
     main,
 )
 from sheets import SheetsClient
@@ -28,8 +30,6 @@ from state_machine import (
     sync_status,
     transition,
 )
-
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +354,10 @@ def test_resolve_model_raises_when_no_matching_model():
             def list():
                 class M:
                     id = "claude-2-0-deprecated"
+
                 class Resp:
-                    data = [M()]
+                    data: ClassVar[list] = [M()]
+
                 return Resp()
 
     with pytest.raises(RuntimeError, match="no claude-3-5-sonnet variant was found"):
@@ -369,8 +371,10 @@ def test_resolve_model_returns_preferred_when_present():
             def list():
                 class M:
                     id = "claude-3-5-sonnet-20241022"
+
                 class Resp:
-                    data = [M()]
+                    data: ClassVar[list] = [M()]
+
                 return Resp()
 
     result = research.resolve_model(GoodClient(), preferred="claude-3-5-sonnet-20241022")
@@ -597,7 +601,8 @@ def test_unsubscribe_link_url_encodes_plus_address(monkeypatch):
         class Block:
             type = "text"
             text = '{"subject": "Hi", "body": "Let me know."}'
-        content = [Block()]
+
+        content: ClassVar[list] = [Block()]
 
     class FakeClient:
         class messages:

@@ -1,4 +1,4 @@
-"""Stateless entrypoint executed by the Railway Cron Job.
+""""Stateless entrypoint executed by the Railway Cron Job.
 
 Flow per run (§2):
   1. Check control.is_locked; if set and < LOCK_TTL_MINUTES old, exit (another
@@ -190,8 +190,13 @@ def main(argv: list[str] | None = None) -> int:
             print("No actionable lead. Nothing to do.")
             return 0
 
-        updated = transition(lead, provider, model=model, dry_run=dry_run,
-                             sheets=sheets)
+        updated = transition(
+            lead,
+            provider,
+            model=model,
+            dry_run=dry_run,
+            sheets=sheets,
+        )
         sheets.batch_update_leads([updated])
 
         if updated.get("state") == config.STATE_SENT and not dry_run:
