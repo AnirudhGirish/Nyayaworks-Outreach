@@ -119,8 +119,7 @@ def _extract_json(text: str) -> dict[str, Any]:
     # The model is instructed to output JSON only, but be defensive.
     if text.startswith("```"):
         text = text.split("```", 2)[1]
-        if text.startswith("json"):
-            text = text[4:]
+        text = text.removeprefix("json")
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:

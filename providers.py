@@ -7,9 +7,9 @@ for detecting human replies landing in the mailbox.
 from __future__ import annotations
 
 import email
+from abc import ABC, abstractmethod
 import imaplib
 import ssl
-from abc import ABC, abstractmethod
 from typing import Any, cast
 
 import config
