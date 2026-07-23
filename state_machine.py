@@ -31,7 +31,7 @@ def _refetch_lead(sheets, row_id: str) -> dict[str, Any] | None:
         for lead in leads:
             if lead.get("row_id") == row_id:
                 return lead
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     return None
 
@@ -51,7 +51,7 @@ def _has_duplicate_sent(sheets, email: str, row_id: str) -> bool:
                 continue
             if (lead.get("email") or "").lower() == email.lower() and lead.get("state") in sent_or_later:
                 return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return False
 
@@ -222,7 +222,7 @@ def sync_status(
 
         try:
             event = provider.get_email_status(msg_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # Non-fatal per-lead status fetch error
             print(f"Status check error for lead {lead.get('row_id')}: {exc}")
             continue
@@ -263,13 +263,13 @@ def sync_status(
         messages = provider.fetch_unread()
         if sheets is not None:
             sheets.set_control({"last_error": ""})
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         err_msg = f"IMAP fetch failed: {exc}"
         print(f"sync_status: {err_msg}")
         if sheets is not None:
             try:
                 sheets.set_control({"last_error": err_msg})
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         messages = []
 

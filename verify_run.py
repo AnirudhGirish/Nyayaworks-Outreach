@@ -2,14 +2,15 @@
 
 Run this script to simulate a single execution run end-to-end.
 """
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+
 from dotenv import load_dotenv
 
-load_dotenv()
+import config
+from sheets import GspreadClient
+import state_machine
 
-import config  # noqa: E402
-from sheets import GspreadClient  # noqa: E402
-import state_machine  # noqa: E402
+load_dotenv()
 
 
 def verify_pipeline():

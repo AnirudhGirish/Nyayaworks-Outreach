@@ -204,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         try:
             _release_lock(sheets)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             # Never let a lock-release failure mask the original error.
             pass
 

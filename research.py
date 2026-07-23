@@ -128,14 +128,14 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 def _validate_research(obj: Any) -> dict[str, Any]:
     if not isinstance(obj, dict):
-        raise ValueError("research result is not an object")
+        raise TypeError("research result is not an object")
     required = {"firm_name", "practice_areas", "location", "notable_fact", "confidence"}
     if not required.issubset(obj.keys()):
         raise ValueError(f"research result missing keys: {required - obj.keys()}")
     if obj["confidence"] not in ("high", "low"):
         raise ValueError("research confidence must be 'high' or 'low'")
     if not isinstance(obj["practice_areas"], list):
-        raise ValueError("practice_areas must be a list")
+        raise TypeError("practice_areas must be a list")
     return obj
 
 
