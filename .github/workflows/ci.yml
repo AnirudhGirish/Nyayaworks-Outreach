@@ -28,7 +28,7 @@ jobs:
 
       - name: Run Ruff Linter
         run: |
-          ruff check config.py guardrails.py providers.py research.py run.py sheets.py state_machine.py template.py verify_run.py
+          ruff check . --exclude .venv
 
       - name: Run Mypy Type Checker
         run: |
